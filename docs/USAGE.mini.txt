@@ -1,0 +1,8 @@
+【星枢 v5】base=http://<host>:<port>
+默认：POST /ask {"query":"...","top_k":5} → 用 contract 或 pack（勿 dump 全文）
+会话起：POST /v5/bootstrap {"focus":"主题"} → 用 bootstrap
+写入：POST /memory/add {"content","category","importance"}
+vault 命中必 readback；trust=canon/source 可执行；superseded 勿用
+加速：llm_deep=off llm_answer=false | 详文：GET /help?level=short 或 full
+密钥: POST /secrets/store | get(reveal) | catalog-sync；明文禁入星枢
+收尾：POST /v5/session-extract {transcript,focus} | 分层：GET /v5/layered-recall?focus=

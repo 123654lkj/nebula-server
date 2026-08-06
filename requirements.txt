@@ -1,0 +1,11 @@
+# 核心依赖（必需）
+flask>=3.0
+numpy>=1.26
+requests>=2.31
+
+# 可选：本地 reranker（BAAI/bge-reranker-v2-m3），不装则跳过重排，检索功能不受影响
+# torch>=2.0
+# transformers>=4.40
+
+# 可选：MCP 工具注册（/mcp + 装饰器工具），不装则仅 REST API 可用
+# mcp>=1.0
