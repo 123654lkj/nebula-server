@@ -1,0 +1,58 @@
+services:
+  nebula:
+    build: .
+    image: nebula-memory:local
+    container_name: nebula
+    restart: unless-stopped
+    ports:
+      - "${NEBULA_PORT:-26670}:26670"
+    env_file:
+      - .env
+    environment:
+      NEBULA_HOST: "0.0.0.0"
+      NEBULA_PORT: "26670"
+      NEBULA_DB_PATH: /app/data/memory_vectors.db
+      VAULT_ROOT: /app/vault/notes
+      BAILIAN_API_KEY: ${BAILIAN_API_KEY:-}
+      BAILIAN_BASE_URL: ${BAILIAN_BASE_URL:-}
+      NEBULA_LLM_MODEL: ${NEBULA_LLM_MODEL:-qwen3.7-plus}
+    volumes:
+      # 持久化向量库
+      - nebula-data:/app/data
+      # 挂载你的黑曜石/Obsidian notes（默认同包内模板）
+      - ${VAULT_HOST_PATH:-./vault/notes}:/app/vault/notes
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:26670/v5/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # 可选：定时同步 vault → 星枢
+  vault-sync:
+    image: nebula-memory:local
+    container_name: nebula-vault-sync
+    restart: unless-stopped
+    depends_on:
+      nebula:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NEBULA_URL: http://nebula:26670
+      VAULT_ROOT: /app/vault/notes
+      VAULT_NEBULA_STATE: /app/data/vault-sync-state.json
+      VAULT_NEBULA_LOG: /app/data/vault-sync.log
+    volumes:
+      - nebula-data:/app/data
+      - ${VAULT_HOST_PATH:-./vault/notes}:/app/vault/notes
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          python /app/scripts/vault_to_nebula_sync.py || true
+          sleep $${VAULT_SYNC_INTERVAL_SEC:-900}
+        done
+
+volumes:
+  nebula-data:

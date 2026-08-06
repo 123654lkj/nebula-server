@@ -1,0 +1,10 @@
+[Unit]
+Description=Nebula lifecycle daily
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+Unit=nebula-lifecycle.service
+
+[Install]
+WantedBy=timers.target

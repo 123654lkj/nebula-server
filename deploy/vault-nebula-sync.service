@@ -1,0 +1,17 @@
+[Unit]
+Description=Obsidian vault → Nebula incremental sync
+After=network-online.target nebula-memory.service
+Wants=nebula-memory.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/nebula
+EnvironmentFile=-/opt/nebula/.env
+Environment=NEBULA_URL=http://127.0.0.1:26670
+# VAULT_ROOT 默认指向包内 vault/notes；生产可改成你的 Obsidian 路径
+ExecStart=/opt/nebula/.venv/bin/python /opt/nebula/scripts/vault_to_nebula_sync.py
+Nice=10
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

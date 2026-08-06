@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync Obsidian vault core notes to Nebula every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+Unit=vault-nebula-sync.service
+
+[Install]
+WantedBy=timers.target

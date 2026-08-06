@@ -1,139 +1,180 @@
-# 星枢 Nebula — 个人/家庭向量记忆系统
+# 星枢 Nebula — 完整可部署包
 
-> 让 AI 记住一切：跨会话、跨 Agent 的语义记忆 + 检索 + 治理，单文件 SQLite 存储，一条命令启动。
+> **向量记忆服务 + 黑曜石/Obsidian 笔记（L1）+ 增量同步 + 治理脚本**  
+> 目标：`git clone` / `npm` **一条命令**就能在自己的机器跑起来。
 
-星枢（Nebula）是一套**自托管的向量记忆服务**：把任何文本（笔记、会话、文档、日志）embedding 后存入 SQLite，通过 REST/MCP 接口提供语义检索、可信度分层（trust）、会话注入（bootstrap）、自动治理（supersede/压缩/降权）等能力。设计目标：**AI Agent 的长期记忆层**，个人部署、无外部向量数据库、可备份可迁移。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## 亮点
+---
 
-- **零外部存储依赖**：向量直接存 SQLite（BLOB + numpy 内存矩阵），无 faiss/redis/pgvector，备份 = 拷一个文件
-- **多引擎**：`ultimate`（v5，图+多跳+LLM 裁决）/ `reflect`（v4，反思检索）/ 混合检索（向量 + 关键词）
-- **可信度分层**：canon / source / synthesis / hearsay / superseded，带权威衰减与自动降权
-- **省 token 设计**：`contract`（裁决短文）+ `pack`（紧凑证据），Agent 按需取用，不为全文烧 token
-- **可选增强**：本地 reranker 重排（bge-reranker-v2-m3）、Vaultwarden 密钥桥、MCP 工具注册——都不装也能跑核心功能
-- **治理自动化**：去重、压缩、过时标记（supersede）、生命周期降权、回归自检
+## 它是什么
 
-## 快速开始
+| 层 | 组件 | 作用 |
+|----|------|------|
+| **L1** | `vault/` 黑曜石笔记（Obsidian） | **权威正文**，人可编辑 |
+| **L3** | `vector_memory_server.py` 星枢 API | 语义索引、bootstrap/ask/contract |
+| **桥** | `scripts/vault_to_nebula_sync.py` | 笔记 → 向量库增量同步（白名单+体积帽） |
+| **治** | scorecard / regression / lifecycle / backup | 可量化健康与回归 |
 
-### 1. 准备
+**不是**聊天记录垃圾场；**不是**密钥库；个人隐私与内网配置不会进仓库。
 
-- Python 3.10+
-- 一个百炼（DashScope）API key（embedding + LLM 改写用），或在环境变量指定兼容 OpenAI 格式的端点
+---
 
-### 2. 安装
+## 一条命令部署（推荐）
+
+### A. Docker（最完整：API + 持久化 + vault 同步守护）
 
 ```bash
 git clone <repo-url> nebula && cd nebula
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
+cp .env.example .env
+# 编辑 .env：填入 BAILIAN_API_KEY
+# 若要用自己的 Obsidian 库：VAULT_HOST_PATH=/path/to/your/vault/notes
 
-### 3. 配置
+npm run docker:up
+# 等价: docker compose up -d --build
 
-```bash
-export BAILIAN_API_KEY=sk-xxx            # 必填：embedding/LLM 走百炼
-# 可选：
-export NEBULA_LLM_MODEL=qwen3.7-plus     # LLM 模型（默认 qwen3.7-plus）
-export NEBULA_PORT=26670                 # 服务端口
-export NEBULA_HOST=0.0.0.0               # 监听地址
-export NEBULA_DB_PATH=./data/memory_vectors.db  # 数据库位置（默认同目录 data/）
-```
-
-兼容任意 OpenAI 格式网关：
-
-```bash
-export BAILIAN_BASE_URL=https://your-gateway/v1
-```
-
-### 4. 启动
-
-```bash
-python3 vector_memory_server.py
-```
-
-或一键脚本：`./install.sh`（自动装依赖 + 生成 systemd 单元 + 开机自启）。
-
-### 5. 验证
-
-```bash
 curl -s http://127.0.0.1:26670/v5/health
-# → {"version":"v5.0-ultimate","total_active":0,...}（新库为空）
 ```
 
-## Agent 接入（标准流程）
+### B. npm / 本机 Python
 
+```bash
+git clone <repo-url> nebula && cd nebula
+npm run setup          # venv + pip + .env
+# 编辑 .env 填 BAILIAN_API_KEY
+npm start              # 启动 API
+# 另一终端
+npm run sync           # 把 vault/notes 同步进星枢
 ```
-1) 接任务  → POST /v5/bootstrap {"focus":"主题"}     # 会话开场注入
-2) 提问    → POST /ask {"query":"...","top_k":5}     # contract→pack→results
-3) 写入    → POST /memory/add {"content","category","importance"}
-4) 收尾    → POST /v5/session-extract {transcript,focus}  # 会话精华回写
+
+### C. 只要二进制式体验
+
+```bash
+npx --yes . setup && npx --yes . docker:up
+# 在包根目录
 ```
 
-MCP 客户端：`python3 vector_memory_server.py` 同时暴露 `/mcp`（JSON-RPC）端点，或直接 import 工具函数。
+---
 
-## 环境变量一览
+## 黑曜石笔记（必含）
 
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `BAILIAN_API_KEY` | — | **必填**，百炼/DashScope API key |
-| `BAILIAN_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容端点 |
-| `NEBULA_LLM_MODEL` | `qwen3.7-plus` | LLM 模型（改写/裁决/压缩） |
-| `NEBULA_HOST` / `NEBULA_PORT` | `0.0.0.0` / `26670` | 监听地址端口 |
-| `NEBULA_DB_PATH` | `./data/memory_vectors.db` | 数据库路径 |
-| `NEBULA_VAULT_ROOT` | 空 | 本地知识库根目录（启用 `readback` 原文回读提示） |
-| `NEBULA_CA_PATH` | 空 | 自定义 CA 证书（自签 HTTPS 网关用） |
-| `NEBULA_ARK_CONFIG` | 空 | 火山方舟配置文件路径（可选） |
-| `BW_SESSION_FILE` | 空 | Vaultwarden session 文件（可选密钥桥） |
+包内自带 **可直接用 Obsidian 打开** 的 vault 模板：
+
+```text
+vault/
+├── .obsidian/          # 最小配置
+├── README.md
+└── notes/
+    ├── HOME.md         # 总入口
+    ├── PROJECT.md
+    ├── 00-元信息/ …
+    ├── 01-用户画像/ …
+    └── 团子学习/ …     # 大体量区，默认同步白名单
+```
+
+1. 用 Obsidian：**Open folder as vault** → 选 `vault/`
+2. 按 `HOME.md` 写你的知识
+3. `npm run sync` 或 Docker 的 `vault-sync` 服务自动每 15 分钟同步
+
+挂载你**已有**的 Obsidian 库：
+
+```bash
+# .env
+VAULT_HOST_PATH=/home/you/Documents/MyVault/notes
+```
+
+```yaml
+# docker-compose 已支持 VAULT_HOST_PATH
+```
+
+冲突裁决：**笔记原文 > 星枢 vault: chunk > 其它碎片**。
+
+---
 
 ## 目录结构
 
-```
-nebula/
-├── vector_memory_server.py   # REST + MCP 服务入口（Flask）
-├── vector_memory.py          # 核心：存储/检索/治理（87KB）
-├── nebula_v5.py              # ultimate 引擎（图+多跳+LLM 裁决）
-├── nebula_v4.py              # reflect 引擎 + 迁移/回填
-├── reranker.py               # 可选：本地 bge-reranker-v2-m3
-├── nebula_secrets.py         # 可选：Vaultwarden 密钥桥
-├── nebula_session_extract.py # 会话精华抽取/分层召回
-├── docs/                     # API 文档（/help 同源）
-├── data/                     # SQLite 数据库（运行时生成，备份此目录即可）
-└── install.sh                # 一键部署（venv+依赖+systemd）
+```text
+├── vector_memory_server.py   # HTTP API（生产同源脱敏）
+├── vector_memory.py / v4/v5  # 检索引擎
+├── nebula_secrets.py         # 可选 Vaultwarden 桥（无则降级）
+├── vault/                    # 黑曜石/Obsidian 模板
+├── scripts/
+│   ├── vault_to_nebula_sync.py
+│   ├── memory_scorecard.py
+│   ├── nebula_regression.py
+│   └── backup-nebula.sh
+├── deploy/                   # systemd 单元 + install-systemd.sh
+├── docker-compose.yml
+├── Dockerfile
+├── package.json / bin/nebula.js
+├── install.sh / start.sh
+└── docs/ USAGE*
 ```
 
-## 部署为 systemd 服务
+---
+
+## Agent 接入
+
+```
+1) POST /v5/bootstrap  {"focus":"主题"}
+2) POST /ask           {"query":"...","top_k":5}  → 用 contract/pack
+3) vault 命中          → 按 readback 回读 L1 原文
+4) POST /memory/add    会话结论（禁密钥）
+```
 
 ```bash
-sudo ./install.sh            # 生成 /etc/systemd/system/nebula.service 并 enable --now
-sudo systemctl status nebula
+curl -s http://127.0.0.1:26670/help
 ```
 
-## 数据备份 / 迁移
+---
+
+## 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `BAILIAN_API_KEY` | **必填** embedding/LLM |
+| `BAILIAN_BASE_URL` | 可选，OpenAI 兼容网关 |
+| `NEBULA_PORT` | 默认 26670 |
+| `VAULT_ROOT` / `VAULT_HOST_PATH` | 笔记目录 |
+| `NEBULA_URL` | 同步脚本目标，默认本机 |
+
+完整见 `.env.example`。
+
+---
+
+## systemd（Linux 服务器）
 
 ```bash
-# 备份：拷一个文件即可
-cp data/memory_vectors.db backup-$(date +%F).db
-# 迁移：新机器上指向同一个 db 文件即可
-export NEBULA_DB_PATH=/path/to/backup.db
+sudo bash deploy/install-systemd.sh
+# 启用：nebula-memory + vault-nebula-sync.timer + lifecycle.timer
 ```
 
-## API 速查
+---
 
-完整文档见 `docs/USAGE.md`（或运行后 `GET /help?level=full`）。
+## 验证清单
 
-| 方法 | 路径 | 用途 |
-|------|------|------|
-| POST | `/ask` | 终极问答（ultimate 引擎） |
-| POST | `/v5/answer` | 同 ultimate |
-| POST/GET | `/v5/bootstrap` | 会话注入 |
-| POST/GET | `/search` | 快速检索（compact） |
-| POST | `/search_rerank` | 向量+改写+rerank |
-| POST | `/memory/add` | 写入记忆 |
-| POST | `/memory/supersede` | 标记过时 |
-| GET | `/v5/health` | 健康/成熟度/trust 分布 |
-| GET | `/help` | 文档（mini/short/full） |
-| POST | `/mcp` | MCP JSON-RPC |
+```bash
+npm run health
+npm run sync
+curl -s -X POST http://127.0.0.1:26670/memory/add \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"hello nebula","category":"note","importance":0.5}'
+curl -s -X POST http://127.0.0.1:26670/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"hello","top_k":3}'
+```
 
-## 许可
+---
 
-MIT License（见 LICENSE）。
+## 与 `nebula-memory` 方法论仓库的关系
+
+| 仓库 | 定位 |
+|------|------|
+| [nebula-memory](https://github.com/123654lkj/nebula-memory) | 契约 / SOP / 离线参考引擎 |
+| **本仓库** | **可部署的生产服务器 + 黑曜石同步** |
+
+---
+
+## License
+
+MIT — 见 [LICENSE](LICENSE)

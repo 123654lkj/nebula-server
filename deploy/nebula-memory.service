@@ -1,0 +1,15 @@
+[Unit]
+Description=Nebula (星枢) vector memory server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nebula
+EnvironmentFile=-/opt/nebula/.env
+ExecStart=/opt/nebula/.venv/bin/python /opt/nebula/vector_memory_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

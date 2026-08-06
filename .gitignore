@@ -1,18 +1,15 @@
-# 运行时
 __pycache__/
 *.pyc
 .venv/
 .env
-
-# 数据（不提交个人记忆库）
+node_modules/
 data/*.db
 data/*.db-*
 data/*.db-shm
 data/*.db-wal
-
-# 模型缓存 / 临时
-~/.cache/modelscope/
+data/backups/
+data/vault-sync-state.json
+data/vault-sync.log
+data/scorecard/
 *.log
-
-# 保留空目录
-!data/.gitkeep
+.DS_Store

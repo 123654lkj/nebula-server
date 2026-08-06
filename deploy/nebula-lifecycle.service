@@ -1,0 +1,14 @@
+[Unit]
+Description=Nebula v5 lifecycle (demote + topic links)
+After=nebula-memory.service
+Wants=nebula-memory.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/opt/nebula/.env
+# 调用 REST lifecycle（若服务内置）
+ExecStart=/usr/bin/curl -sf -X POST http://127.0.0.1:26670/v5/lifecycle -H "Content-Type: application/json" -d "{}"
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
