@@ -175,6 +175,33 @@ curl -s -X POST http://127.0.0.1:26670/ask \
 
 ---
 
+
+
+---
+
+## Agent 接入层（hooks + skills · 完整记忆的一半）
+
+只起 API **不等于**记忆系统。本包包含可安装到多 Agent 的门禁与钩子：
+
+```bash
+export NEBULA_BASE_URL=http://127.0.0.1:26670
+npm run agents:install
+# 或 ./agents/install-agents.sh all
+# Windows: pwsh -File agents/install-agents.ps1
+```
+
+| 组件 | 路径 |
+|------|------|
+| 五门 + nebula-recall | `agents/skills/` |
+| SessionStart bootstrap | `agents/hooks/common/` |
+| Grok/Codex/Claude/Cursor/Hermes/Reasonix/OpenClaw | `agents/hooks/<agent>/` |
+| OpenCode 插件 | `agents/integrations/opencode/` |
+| 通用 AGENTS 片段 | `agents/snippets/AGENTS.memory.md` |
+
+详见 **[agents/README.md](agents/README.md)**。
+
+适配矩阵：Grok · Codex · OpenCode · Claude · Cursor · Hermes · Reasonix · OpenClaw。
+
 ## License
 
 MIT — 见 [LICENSE](LICENSE)

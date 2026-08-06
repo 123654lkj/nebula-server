@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "bash ${HOME}/.nebula/hooks/session-start-memory.sh"
+      }
+    ]
+  }
+}

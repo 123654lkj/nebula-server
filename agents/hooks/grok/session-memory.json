@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 12,
+            "command": "REPLACE_WITH_BASH_OR_PWSH"
+          }
+        ]
+      }
+    ]
+  }
+}

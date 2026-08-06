@@ -1,7 +1,7 @@
 {
   "name": "nebula-memory-server",
   "version": "1.0.0",
-  "description": "星枢 Nebula — 向量记忆 + 黑曜石/Obsidian 笔记同步，一键部署",
+  "description": "星枢完整记忆系统：API + Obsidian vault 同步 + multi-agent hooks/skills",
   "bin": {
     "nebula": "bin/nebula.js"
   },
@@ -14,12 +14,21 @@
     "docker:up": "docker compose up -d --build",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f nebula",
-    "postinstall": "node bin/nebula.js doctor --quiet || true"
+    "postinstall": "node bin/nebula.js doctor --quiet || true",
+    "agents:install": "node bin/nebula.js agents-install",
+    "agents:list": "bash agents/install-agents.sh --list || node bin/nebula.js agents-list"
   },
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["nebula", "memory", "obsidian", "rag", "agent", "vector"],
+  "keywords": [
+    "nebula",
+    "memory",
+    "obsidian",
+    "rag",
+    "agent",
+    "vector"
+  ],
   "license": "MIT",
   "files": [
     "bin",

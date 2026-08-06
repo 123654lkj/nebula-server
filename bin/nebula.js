@@ -118,6 +118,27 @@ function cmdScore() {
   run(py(), ["scripts/memory_scorecard.py"]);
 }
 
+
+function cmdAgentsInstall() {
+  const sh = path.join(ROOT, "agents", "install-agents.sh");
+  const ps = path.join(ROOT, "agents", "install-agents.ps1");
+  if (isWin) {
+    if (!fs.existsSync(ps)) die("missing agents/install-agents.ps1");
+    return run("pwsh", ["-NoProfile", "-File", ps, ...process.argv.slice(3)]);
+  }
+  if (!fs.existsSync(sh)) die("missing agents/install-agents.sh");
+  return run("bash", [sh, ...process.argv.slice(3)]);
+}
+
+function cmdAgentsList() {
+  const matrix = `Agent adapters:
+  grok codex claude cursor hermes opencode reasonix openclaw
+Install: npm run agents:install
+  or: ./agents/install-agents.sh all
+`;
+  log(matrix);
+}
+
 function cmdDockerUp() {
   if (!which("docker")) die("docker not found");
   if (!fs.existsSync(path.join(ROOT, ".env"))) {
@@ -138,6 +159,10 @@ function main() {
     case "sync": return cmdSync();
     case "health": return cmdHealth();
     case "score": return cmdScore();
+    case "agents-install":
+    case "agents:install": return cmdAgentsInstall();
+    case "agents-list":
+    case "agents:list": return cmdAgentsList();
     case "docker:up":
     case "up": return cmdDockerUp();
     case "help":
@@ -150,6 +175,7 @@ function main() {
   npx nebula sync         # 黑曜石笔记 → 星枢
   npx nebula health
   npx nebula docker:up    # Docker 一键（推荐）
+  npx nebula agents-install [grok|codex|...|all]
   npx nebula score
 
 一条命令（Docker）:

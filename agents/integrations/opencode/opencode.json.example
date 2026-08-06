@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "./plugins/nebula-memory.js"
+  ],
+  "skills": {
+    "paths": [
+      "../../skills"
+    ]
+  },
+  "permission": {
+    "skill": {
+      "*": "allow",
+      "workflow-discipline": "allow",
+      "ponytail": "allow",
+      "recall-before-code": "allow",
+      "verify-before-assert": "allow",
+      "correction-capture": "allow",
+      "nebula-recall": "allow"
+    }
+  },
+  "instructions": []
+}

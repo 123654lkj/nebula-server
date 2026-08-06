@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "nebula": {
+      "url": "http://127.0.0.1:26670/mcp",
+      "transport": "sse",
+      "description": "Nebula L2 memory (optional; server must enable MCP)"
+    }
+  },
+  "httpTools": [
+    {"name": "nebula_bootstrap", "method": "POST", "url": "http://127.0.0.1:26670/v5/bootstrap"},
+    {"name": "nebula_ask", "method": "POST", "url": "http://127.0.0.1:26670/ask"},
+    {"name": "nebula_add", "method": "POST", "url": "http://127.0.0.1:26670/memory/add"}
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 12,
+            "command": "bash ${HOME}/.grok/hooks/session-start-memory.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

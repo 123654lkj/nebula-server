@@ -1,0 +1,3 @@
+# 可选：若你的 Codex 版本支持 project instructions include
+# 将 agents/snippets/AGENTS.memory.md 内容并入 AGENTS.md 即可
+# NEBULA_BASE_URL=http://127.0.0.1:26670
