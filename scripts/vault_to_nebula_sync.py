@@ -290,17 +290,24 @@ def split_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_O
         chunks.extend(_hard_split(buf, chunk_size, overlap))
     return [c for c in chunks if c.strip()]
 
+def _default_db_path() -> Path:
+    env = os.environ.get("NEBULA_DB_PATH")
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parents[1] / "data" / "memory_vectors.db"
+
+
 def wrap_chunk(path: Path, source_key: str, title: str, idx: int, total: int, body: str) -> str:
     rel = source_key.replace(SOURCE_PREFIX, "")
     return (
-        f"[虎虎笔记] path={rel} source={source_key} title={title} chunk={idx+1}/{total}\n"
-        f"回读命令: rxt read --host huhu \"{path.as_posix()}\"\n"
+        f"[笔记] path={rel} source={source_key} title={title} chunk={idx+1}/{total}\n"
+        f"回读: read \"{path.as_posix()}\"\n"
         f"---\n{body.strip()}"
     )
 
 def delete_source(source_key: str) -> int:
     import sqlite3
-    db = Path("/opt/nebula/data/memory_vectors.db")
+    db = _default_db_path()
     if not db.exists():
         return 0
     con = sqlite3.connect(str(db), timeout=30)
@@ -377,7 +384,10 @@ def rebuild_state_from_db(state: dict, files: List[Path]) -> None:
     """用磁盘指纹回填 state，避免重复删建。"""
     by_key = {vault_source_key(p): p for p in files}
     import sqlite3
-    con = sqlite3.connect("/opt/nebula/data/memory_vectors.db")
+    db = _default_db_path()
+    if not db.exists():
+        return
+    con = sqlite3.connect(str(db))
     rows = con.execute(
         "SELECT source_file, COUNT(*) FROM memories WHERE source_file LIKE 'vault:%' GROUP BY source_file"
     ).fetchall()

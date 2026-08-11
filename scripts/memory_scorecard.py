@@ -397,7 +397,7 @@ def render_md(rep: Dict[str, Any]) -> str:
     lines.append(json.dumps(rep["raw"], ensure_ascii=False, indent=2))
     lines.append("```")
     lines.append("")
-    lines.append("评分脚本：`/opt/nebula/scripts/memory_scorecard.py`")
+    lines.append("评分脚本：`scripts/memory_scorecard.py`（包内）")
     return "\n".join(lines) + "\n"
 
 

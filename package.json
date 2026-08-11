@@ -1,7 +1,15 @@
 {
-  "name": "nebula-memory-server",
+  "name": "nebula-server",
   "version": "1.0.0",
-  "description": "星枢完整记忆系统：API + Obsidian vault 同步 + multi-agent hooks/skills",
+  "description": "星枢 Nebula 可部署记忆服务：HTTP API + Obsidian 同步 + multi-agent hooks/skills",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/123654lkj/nebula-server.git"
+  },
+  "homepage": "https://github.com/123654lkj/nebula-server#readme",
+  "bugs": {
+    "url": "https://github.com/123654lkj/nebula-server/issues"
+  },
   "bin": {
     "nebula": "bin/nebula.js"
   },

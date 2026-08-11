@@ -11,14 +11,16 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-DB = Path("/opt/nebula/data/memory_vectors.db")
-BASE = "http://127.0.0.1:26670"
+_ROOT = Path(__file__).resolve().parents[1]
+DB = Path(os.environ.get("NEBULA_DB_PATH", str(_ROOT / "data" / "memory_vectors.db")))
+BASE = os.environ.get("NEBULA_URL", "http://127.0.0.1:26670").rstrip("/")
 DRY = "--apply" not in sys.argv
 LIMIT = 400  # 单次上限，防一次砍光
 
