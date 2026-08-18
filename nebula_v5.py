@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-星枢 Nebula v5 — 终极形态引擎
+星枢 Nebula v5 — 终极形态引擎（v6 抽取层已接）
 ================================
 在 v4 (trust/links/reflect) 之上：
 1. ultimate_ask：reflect + 弱结果 LLM 深改写 + 答案合成
@@ -9,6 +9,7 @@
 3. lifecycle_run：synthesis 衰减/摘要晋升、不伤 vault/canon
 4. entity_topic_links：主题共现边
 5. bootstrap_context：会话启动 L0 注入包（省 token）
+6. session_extract v6：memory_layer + abstract + episode（见 nebula_session_extract）
 """
 from __future__ import annotations
 
@@ -16,16 +17,27 @@ import json
 import logging
 import re
 import time
+import threading
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("nebula.v5")
+try:
+    from nebula_meta import RELEASE as _NEBULA_VER
+except Exception:
+    _NEBULA_VER = "v5.1.0"
 
 
-def _llm_chat(system: str, user: str, max_tokens: int = 400, temperature: float = 0.3) -> str:
-    """统一 LLM 调用（百炼兼容接口）。"""
+def _llm_chat(system: str, user: str, max_tokens: int = 400, temperature: float = 0.3,
+              extra: Optional[Dict[str, Any]] = None) -> str:
+    """统一 LLM 调用（MiniMax / 百炼兼容接口）。"""
     import os
-    api_key = os.environ.get("BAILIAN_API_KEY") or os.environ.get("DASHSCOPE_API_KEY") or ""
+    api_key = (
+        os.environ.get("NEBULA_LLM_API_KEY")
+        or os.environ.get("BAILIAN_API_KEY")
+        or os.environ.get("DASHSCOPE_API_KEY")
+        or ""
+    )
     if not api_key:
         return ""
     try:
@@ -34,38 +46,94 @@ def _llm_chat(system: str, user: str, max_tokens: int = 400, temperature: float 
             "BAILIAN_CHAT_URL",
             "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         )
-        model = os.environ.get("NEBULA_LLM_MODEL") or "qwen3.7-plus"  # 全链路唯一 LLM
+        if not (base or "").strip():
+            base = "https://api.minimaxi.com/v1/chat/completions"
+        model = os.environ.get("NEBULA_LLM_MODEL") or "MiniMax-M3"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if extra:
+            payload.update(extra)
         resp = requests.post(
             base,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            },
-            timeout=8,  # [perf] 深搜/润色勿拖死 /ask
+            json=payload,
+            timeout=float(os.environ.get("NEBULA_LLM_TIMEOUT", "8")),  # extract 可调高
         )
         if resp.status_code != 200:
             logger.warning("llm http %s %s", resp.status_code, resp.text[:200])
             return ""
-        text = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-        text = re.sub(r"<think[^>]*>.*?</[^>]*think[^>]*>", "", text, flags=re.DOTALL)
+        msg = (resp.json().get("choices") or [{}])[0].get("message") or {}
+        text = msg.get("content") or ""
+        if isinstance(text, list):
+            text = "".join(
+                (p.get("text") or p.get("content") or "") if isinstance(p, dict) else str(p)
+                for p in text
+            )
+        raw = text or ""
+        text = re.sub(r"<think[^>]*>.*?</[^>]*think[^>]*>", "", raw, flags=re.DOTALL)
         text = re.sub(r"<think[^>]*>.*", "", text, flags=re.DOTALL)
-        return (text or "").strip()
+        text = (text or "").strip()
+        if not text:
+            # MiniMax-M3 思考模型：答案可能在 reasoning_content，或整段落在 <think>
+            alt = msg.get("reasoning_content") or msg.get("reasoning") or ""
+            if isinstance(alt, list):
+                alt = "".join(str(x) for x in alt)
+            text = (alt or raw or "").strip()
+        return text
     except Exception as e:
         logger.warning("llm fail: %s", e)
         return ""
+
+
+def _is_truth_src(src: str, trust: str = "") -> bool:
+    s = str(src or "")
+    return (
+        s.startswith("vault:")
+        or s.startswith("notes/")
+        or s.startswith("gateway/")
+        or "/opt/gateway/" in s
+        or trust == "canon"
+    )
+
+
+def _query_tokens(query: str) -> List[str]:
+    """英文标识 + 中文二字切分。停用词不计入重合。"""
+    stop = {
+        "的", "了", "和", "是", "在", "与", "或", "什么", "怎么", "如何", "一下",
+        "这个", "那个", "一个", "能否", "能不能", "the", "and", "for", "how", "what",
+    }
+    raw = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", query or "")
+    out: List[str] = []
+    for t in raw:
+        tl = t.lower()
+        if re.fullmatch(r"[\u4e00-\u9fff]+", t) and len(t) > 2:
+            for i in range(len(t) - 1):
+                bg = t[i : i + 2]
+                if bg not in stop and bg not in out:
+                    out.append(bg)
+        elif tl not in stop and t not in out:
+            out.append(t)
+    return out
+
+
+def _overlap_hits(query: str, blob: str) -> Tuple[int, int]:
+    toks = _query_tokens(query)
+    b = (blob or "").lower()
+    return sum(1 for t in toks if t.lower() in b), len(toks)
 
 
 def compose_answer(query: str, packed: List[Dict]) -> Dict[str, Any]:
     """从 pack 结果合成可执行答案契约（抽取式，默认不调 LLM）。"""
     if not packed:
         return {
-            "answer": "未命中可靠记忆。请扩大 query 或查知识库 HOME/GATEWAY_LOCK。",
+            "answer": "未命中可靠记忆。请扩大 query，或回读 L1 权威原文。",
             "confidence": 0.0,
             "executable": False,
             "evidence": [],
@@ -88,34 +156,59 @@ def compose_answer(query: str, packed: List[Dict]) -> Dict[str, Any]:
                 "id": r.get("id"),
                 "trust": trust,
                 "score": r.get("score"),
+                "rerank_score": r.get("rerank_score"),
                 "src": r.get("src") or r.get("source_file"),
                 "readback": r.get("readback"),
                 "snippet": (r.get("content") or "")[:220],
             }
         )
 
-    # 答案：优先 canon/source 拼接
-    parts = []
-    for e in evidence:
-        if e["trust"] in ("canon", "source"):
-            parts.append(e["snippet"])
-        if len(parts) >= 2:
-            break
-    if not parts and evidence:
-        parts.append(evidence[0]["snippet"])
-
-    answer = "；".join(p.replace("\n", " ").strip() for p in parts if p)[:600]
-    if has_canon:
+    # 顶已是真理库（pin/pack 已决）就别换。只有顶是会话碎片时，才换「重合够」的笔记
+    pick = evidence[0] if evidence else {}
+    if pick and not _is_truth_src(str(pick.get("src") or ""), pick.get("trust") or ""):
+        truth = []
+        for ev in evidence:
+            if not _is_truth_src(str(ev.get("src") or ""), ev.get("trust") or ""):
+                continue
+            hits, ntok = _overlap_hits(
+                query, (ev.get("snippet") or "") + " " + str(ev.get("src") or "")
+            )
+            need = 3 if ntok >= 5 else (2 if ntok >= 3 else 1)
+            if ntok == 0 or hits >= need:
+                ev = dict(ev)
+                ev["_hits"] = hits
+                truth.append(ev)
+        if truth:
+            pick = max(
+                truth,
+                key=lambda ev: (
+                    float(ev.get("rerank_score") or 0),
+                    float(ev.get("_hits") or 0),
+                    float(ev.get("score") or 0),
+                ),
+            )
+    top_snip = (pick.get("snippet") or "").replace("\n", " ").strip()
+    answer = top_snip[:600]
+    top_trust = (pick.get("trust") if pick else "") or "synthesis"
+    if top_trust == "canon":
         conf = 0.88
         executable = True
-    elif any(e["trust"] == "source" for e in evidence):
+    elif top_trust == "source":
         conf = 0.65
         executable = True
-        warnings.append("no_canon_use_source")
+        warnings.append("top_is_source")
     else:
-        conf = 0.35
-        executable = False
-        warnings.append("low_trust_only")
+        # 精排已经把这条选成第一，不再用绝对分阈值（候选只有 4 条时满分才 4）
+        if packed and packed[0].get("rerank_score") is not None:
+            conf = 0.55
+            executable = True
+            warnings.append("top_synthesis_reranked")
+        else:
+            conf = 0.40
+            executable = False
+            warnings.append("top_low_trust")
+    if has_canon and top_trust != "canon":
+        warnings.append("canon_present_not_top")
     if has_super:
         warnings.append("superseded_present_filtered")
 
@@ -196,6 +289,74 @@ def llm_polish_answer(query: str, composed: Dict[str, Any]) -> Optional[str]:
     return text or None
 
 
+def llm_read_answer(query: str, packed: List[Dict]) -> Optional[str]:
+    """评测阅读器：先用日期条硬算 first/间隔，算不出再问 LLM。"""
+    if not packed:
+        return None
+    try:
+        from vector_memory import extract_dated_events, solve_temporal
+    except Exception:
+        extract_dated_events = None
+        solve_temporal = None
+    ev = []
+    all_events: List[Dict] = []
+    for r in packed[:6]:
+        raw = r.get("full") or r.get("content") or ""
+        raw_facts = r.get("dated_facts")
+        events = []
+        if raw_facts and isinstance(raw_facts[0], dict):
+            events = list(raw_facts)
+        elif extract_dated_events:
+            events = extract_dated_events(raw, as_of=r.get("created_at"))
+        all_events.extend(events or [])
+        ts = r.get("created_at")
+        head = f"t={ts} " if ts else ""
+        ev.append(f"{head}{raw[:3500]}")
+    if solve_temporal:
+        computed = solve_temporal(query, all_events)
+        if computed:
+            return computed
+    fact_block = "\n".join(
+        f"- {e.get('date')} | {e.get('sent')}" if isinstance(e, dict) else f"- {e}"
+        for e in all_events[:16]
+    ) or "(none)"
+    system = (
+        "You answer using ONLY Dated facts and Evidence. "
+        "For which-first / which-earlier: pick the event with the earlier date. "
+        "For how-many-days: subtract the two dates and reply like '7 days'. "
+        "Short phrase only. No preamble. "
+        "If a dated fact is related, you must answer — do not say you don't know."
+    )
+    user = f"Question: {query}\n\nDated facts:\n{fact_block}\n\nEvidence:\n" + "\n---\n".join(ev)
+    text = _llm_chat(system, user, max_tokens=400, temperature=0.0) or ""
+    text = re.sub(r"<think[^>]*>.*?</[^>]*think[^>]*>", "", text, flags=re.DOTALL)
+    if "<think" in text.lower():
+        text = text.split("</think>")[-1]
+    text = text.strip().strip('"')
+    if text.lower().startswith("answer:"):
+        text = text.split(":", 1)[1].strip()
+    return text or None
+
+
+def _apply_llm_rerank(query: str, packed: List[Dict], top_k: int) -> Tuple[List[Dict], bool]:
+    """Stage 2：qwen3-rerank 精排后再截 top_k。种子已答则跳过。"""
+    if not packed or len(packed) <= 1:
+        return packed[:top_k], False
+    try:
+        from reranker import apply_rerank, _rerank_enabled, seed_already_answers
+        if not _rerank_enabled():
+            return packed[:top_k], False
+        if seed_already_answers(query, packed[0]):
+            packed[0]["rerank_score"] = packed[0].get("rerank_score")
+            packed[0]["rerank_skip"] = "seed_answers"
+            return packed[:top_k], False
+        wide = apply_rerank(query, list(packed), candidates=len(packed))
+        return wide[:top_k], any(r.get("rerank_score") is not None for r in wide[:top_k])
+    except Exception as e:
+        logger.warning("rerank fail: %s", e)
+        return packed[:top_k], False
+
+
 def ultimate_ask(
     manager,
     query: str,
@@ -208,22 +369,40 @@ def ultimate_ask(
     hops: int = 2,
     llm_deep: str = "auto",  # auto|on|off
     llm_answer: bool = True,
+    rerank: bool = True,
+    temporal_intent: Optional[str] = None,
+    as_of: Optional[float] = None,
+    prefer_layers: Optional[list] = None,
+    reader: bool = False,
+    tenant_id: Optional[str] = None,
+    precomputed_vector=None,
 ) -> Dict[str, Any]:
-    """终极检索：v4 reflect → 条件 LLM 深搜 → 答案合成 → 可选润色。"""
+    """终极检索：v4 reflect → 条件 LLM 深搜 → qwen3-rerank → 答案合成。"""
     from nebula_v4 import reflect_ask
     from vector_memory import pack_results, format_ask_pack, results_token_stats
 
     t0 = time.time()
+    if str(__import__("os").environ.get("NEBULA_RERANK", "1")).lower() in ("0", "false", "off", "no"):
+        rerank = False
+    # 少扩池：扩太宽会灌进弱相关 canon，精排再把短指针顶上去
+    wide_k = max(top_k + 2, 6) if rerank else top_k
     base = reflect_ask(
         manager,
         query=query,
-        top_k=top_k,
+        top_k=wide_k,
         max_chars=max_chars,
         max_total_chars=max_total_chars,
         use_hybrid=use_hybrid,
         category=category,
         use_graph=use_graph,
         hops=hops,
+        drop_hearsay_if_canon=True,
+        max_synthesis=3 if rerank else 1,
+        temporal_intent=temporal_intent,
+        as_of=as_of,
+        prefer_layers=prefer_layers,
+        tenant_id=tenant_id,
+        precomputed_vector=precomputed_vector,
     )
     packed = base.get("results") or []
     stages = list(base.get("stages") or [])
@@ -241,6 +420,10 @@ def ultimate_ask(
                     query=q,
                     top_k=max(top_k * 2, 8),
                     enable_time_decay=True,
+                    temporal_intent=temporal_intent,
+                    as_of=as_of,
+                    category=category,
+                    tenant_id=tenant_id,
                 )
                 for r in raw or []:
                     if r.get("score") is None:
@@ -266,15 +449,43 @@ def ultimate_ask(
         packed = pack_results(
             merged,
             query=query,
-            top_k=top_k,
+            top_k=wide_k,
             max_chars=max_chars,
             per_source=1,
             drop_superseded=True,
             drop_hearsay_if_canon=True,
+            max_synthesis=3 if rerank else 1,
             compact=True,
+            prefer_layers=prefer_layers,
         )
         deep_used = True
         stages.append({"stage": "llm_deep", "queries": deep_queries, "n": len(all_raw)})
+
+    rerank_used = False
+    if rerank:
+        packed, rerank_used = _apply_llm_rerank(query, packed, top_k)
+        if rerank_used:
+            stages.append({
+                "stage": "rerank",
+                "backend": "qwen3-rerank",
+                "model": __import__("os").environ.get("NEBULA_RERANK_MODEL") or "qwen3-rerank",
+                "n": len(packed),
+            })
+        elif packed and packed[0].get("rerank_skip"):
+            stages.append({"stage": "rerank_skip", "reason": packed[0].get("rerank_skip")})
+    else:
+        packed = packed[:top_k]
+
+    # rerank 不得掀文件名/锁：GATEWAY_LOCK.md 必须压过事故分析笔记
+    try:
+        from vector_memory import pin_exact_matches
+        before = [r.get("id") for r in packed[:3]]
+        packed = pin_exact_matches(query, packed)
+        after = [r.get("id") for r in packed[:3]]
+        if before != after:
+            stages.append({"stage": "pin_exact", "keys": True, "moved": True})
+    except Exception:
+        pass
 
     pack_text = format_ask_pack(query, packed, max_total_chars=max_total_chars)
     stats = results_token_stats(packed)
@@ -282,8 +493,16 @@ def ultimate_ask(
     stats["pack_est_tokens"] = max(1, int(len(pack_text) / 2.2))
 
     composed = compose_answer(query, packed)
+    if temporal_intent:
+        composed["temporal_intent"] = temporal_intent
+    if as_of is not None:
+        composed["as_of"] = as_of
     polished = None
-    if llm_answer and composed.get("executable") and composed.get("confidence", 0) >= 0.6:
+    if reader:
+        polished = llm_read_answer(query, packed)
+        if polished:
+            composed["reader"] = True
+    elif llm_answer and composed.get("executable") and composed.get("confidence", 0) >= 0.6:
         polished = llm_polish_answer(query, composed)
     if polished:
         composed["answer_llm"] = polished
@@ -316,13 +535,14 @@ def ultimate_ask(
         "gaps": base.get("gaps") or [],
         "deep_queries": deep_queries,
         "llm_deep_used": deep_used,
+        "rerank_used": rerank_used,
         "stages": stages,
         "raw_candidates": base.get("raw_candidates"),
         "token_stats": stats,
         "elapsed_ms": round((time.time() - t0) * 1000, 1),
         "timing": base.get("timing") or {},
         "engine": "ultimate_v5",
-        "version": "v5.0-ultimate",
+        "version": _NEBULA_VER,
         "hint": "优先用 contract 或 pack；executable=false 时不要当事实执行；vault 必须 readback",
     }
 
@@ -339,18 +559,18 @@ def bootstrap_context(
     t0 = time.time()
     parts = []
     used = 0
-    meta = {"engine": "bootstrap_v5", "fast": True}
+    meta = {"engine": "bootstrap_v5", "fast": True, "layer_hint": "pack prefer abstract"}
 
     # 1) 固定权威提示（短）
     header = (
-        "【L0星枢】权威：GATEWAY_LOCK>知识库>星枢chunk；密钥走 Vaultwarden；"
+        "【L0星枢】权威：GATEWAY_LOCK>虎虎笔记>星枢chunk；密钥走 Vaultwarden；"
         "网络默认冻结。检索用 /ask engine=ultimate。\n"
     )
     parts.append(header)
     used += len(header)
 
     # 2) 焦点 ultimate（启动快路径）
-    fq = (focus_query or "").strip() or "现行架构 星枢用法 工作流"
+    fq = (focus_query or "").strip() or "虎虎现行架构 星枢用法 工作流"
     ult = ultimate_ask(
         manager,
         query=fq,
@@ -362,6 +582,7 @@ def bootstrap_context(
         hops=1,  # 不做 follow-up 多跳 embed
         llm_deep="off",
         llm_answer=False,
+        rerank=False,  # 启动路径不打 MiniMax 重排
     )
     pack = ult.get("pack") or ""
     contract = ult.get("contract") or ""
@@ -383,7 +604,7 @@ def bootstrap_context(
         "est_tokens": max(1, int(len(text) / 2.2)),
         "meta": meta,
         "elapsed_ms": round((time.time() - t0) * 1000, 1),
-        "version": "v5.0-ultimate",
+        "version": _NEBULA_VER,
     }
 
 
@@ -542,23 +763,34 @@ def lifecycle_run(
 
 # health 整包短缓存（避免每次 bw status 1.4s）
 _HEALTH_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None}
-_HEALTH_TTL = 30.0
-_BW_STATUS_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None}
-_BW_STATUS_TTL = 60.0
+_HEALTH_TTL = 60.0
+_BW_STATUS_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None, "refreshing": False}
+_BW_STATUS_TTL = 300.0
 
 
-def _cached_bw_status() -> Dict[str, Any]:
-    now = time.time()
-    if _BW_STATUS_CACHE["payload"] is not None and now - float(_BW_STATUS_CACHE["ts"]) < _BW_STATUS_TTL:
-        return _BW_STATUS_CACHE["payload"]
+def _refresh_bw_status() -> None:
     try:
         from nebula_secrets import bw_status
         st = bw_status() or {}
     except Exception:
-        st = {}
-    _BW_STATUS_CACHE["ts"] = now
+        st = {"ok": False, "status": "error"}
+    _BW_STATUS_CACHE["ts"] = time.time()
     _BW_STATUS_CACHE["payload"] = st
-    return st
+    _BW_STATUS_CACHE["refreshing"] = False
+
+
+def _cached_bw_status() -> Dict[str, Any]:
+    """health 不得同步等 bw CLI（实测 ~1.4s）。过期也先回缓存，后台刷新。"""
+    now = time.time()
+    hit = _BW_STATUS_CACHE.get("payload")
+    ts = float(_BW_STATUS_CACHE.get("ts") or 0)
+    fresh = hit is not None and (now - ts) < _BW_STATUS_TTL
+    if not fresh and not _BW_STATUS_CACHE.get("refreshing"):
+        _BW_STATUS_CACHE["refreshing"] = True
+        threading.Thread(target=_refresh_bw_status, daemon=True).start()
+    if hit is not None:
+        return hit
+    return {"ok": None, "status": "pending"}
 
 
 def health_report(manager) -> Dict[str, Any]:
@@ -574,12 +806,41 @@ def health_report(manager) -> Dict[str, Any]:
     vault_n = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE source_file LIKE 'vault:%' AND is_compressed=0"
     ).fetchone()[0]
+    # v6 memory_layer 分布（JSON 字段，缺省算 unknown）
+    layers = {"semantic": 0, "episodic": 0, "procedural": 0, "unknown": 0}
+    try:
+        for ml, n in conn.execute(
+            """
+            SELECT COALESCE(json_extract(metadata,'$.memory_layer'),'unknown'), COUNT(*)
+            FROM memories WHERE is_compressed=0
+            GROUP BY 1
+            """
+        ).fetchall():
+            key = (ml or "unknown").lower()
+            if key not in layers:
+                layers[key] = 0
+            layers[key] = int(n or 0)
+    except Exception:
+        pass
+    extract_n = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE is_compressed=0 AND source_file='session-extract'"
+    ).fetchone()[0]
+    abstract_n = conn.execute(
+        """
+        SELECT COUNT(*) FROM memories
+        WHERE is_compressed=0 AND json_extract(metadata,'$.abstract') IS NOT NULL
+          AND length(json_extract(metadata,'$.abstract')) > 0
+        """
+    ).fetchone()[0]
     payload = {
-        "version": "v5.0-ultimate",
+        "version": _NEBULA_VER,
         "total_active": total,
         "vault_chunks": vault_n,
         "trust": trust,
         "links": links,
+        "memory_layers": layers,
+        "session_extract_count": extract_n,
+        "abstract_count": abstract_n,
         "maturity": _maturity_score(trust, links, total),
         "cached": False,
     }
@@ -610,7 +871,7 @@ def _maturity_score(trust: Dict, links: Dict, total: int) -> Dict[str, Any]:
     try:
         from pathlib import Path as _P
         import json as _json
-        p = _P(os.path.expanduser("~/.local/state/nebula-regression/latest.json"))
+        p = _P("/home/huhu/.local/state/nebula-regression/latest.json")
         if p.exists():
             reg = _json.loads(p.read_text(encoding="utf-8"))
             pr = float(reg.get("pass_rate") or 0)
@@ -651,7 +912,7 @@ def promote_draft(manager, evidence_query: str = "", session_notes: str = "", ma
     ask = reflect_ask(manager, query=evidence_query or session_notes[:80] or "任务结论", top_k=5, hops=2, use_graph=True)
     pack = ask.get("pack") or ""
     system = (
-        "你是记忆晋升助手。根据证据判断是否应写入知识库。"
+        "你是记忆晋升助手。根据证据判断是否应写入虎虎笔记。"
         "只输出 JSON，不要 markdown 围栏。"
         '格式: {"should_write_vault":true/false,"path":"04-项目笔记/xxx.md","title":"...",'
         '"markdown":"中文正文","category":"lesson|project|fact","importance":0.0-1.0,'

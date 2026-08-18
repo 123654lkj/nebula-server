@@ -1,6 +1,6 @@
 {
   "name": "nebula-server",
-  "version": "1.0.0",
+  "version": "5.1.1",
   "description": "星枢 Nebula 可部署记忆服务：HTTP API + Obsidian 同步 + multi-agent hooks/skills",
   "repository": {
     "type": "git",

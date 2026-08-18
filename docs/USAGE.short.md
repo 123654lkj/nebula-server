@@ -1,28 +1,30 @@
-# 星枢 Nebula 速查（short）
+# 星枢 API 速查（short）
 
-> Base: `http://<host>:<port>` · version `v5.0-ultimate` · 默认端口 26670
+Base `http://192.168.31.252:26670` · **5.1.0**  
+向量 `qwen2.5-vl-embedding` 2048 · 精排 `qwen3-rerank` · LLM（改写/深搜）`NEBULA_LLM_MODEL`
 
-## 铁律
-- `/help` 默认 mini，勿把 full 塞进 system prompt
-- 提问用 `/ask`，优先读 `contract` → `pack` → `results`
-- `trust=canon/source` 且 executable → 可执行；`superseded` 禁用
-- 有 `readback` → 回读原文
-- API key/密码禁止写入向量
+## Agent 必用
 
-## 端点
-| 路径 | 用途 |
-|------|------|
-| POST `/ask {"query","top_k"}` | 终极问答（ultimate） |
-| POST `/v5/bootstrap {"focus"}` | 会话注入 |
-| POST `/memory/add` | 写入 |
-| POST `/memory/supersede` | 标记过时 |
-| GET `/v5/health` | 健康/成熟度 |
-| GET `/help?level=short|full` | 本文档 |
+| 场景 | 方法 | 用返回 |
+|------|------|--------|
+| 开场 | POST `/v5/bootstrap` `{"focus":"任务"}` | **bootstrap** |
+| 问答 | POST `/ask` `{"query":"...","top_k":5}` | **contract** > pack |
+| 写入索引 | POST `/memory/add` | id, trust |
+| 写回真理库 | POST `/memory/promote` `{"title","content"}` | path, vault_key |
+| 图片入库 | POST `/memory/add` + `image` | image_url |
+| 用法 | GET `/help?level=short` | text |
 
-## 加速
-```json
-{"query":"...","llm_deep":"off","llm_answer":false}
-```
+## 裁决
 
-## category
-`ai` `code` `decision` `fact` `identity` `infrastructure` `lesson` `network` `person` `preference` `project` `security`
+- `composed.executable==true` 才当现行
+- `vault:` / `notes/` 压过 session-extract
+- 有 `readback` → `rxt read --host huhu …`
+- `superseded` 禁止当现行
+
+## /ask 常用
+
+`llm_deep`: auto\|on\|off · `no_cache`: true · `image`: 以图搜
+
+## 禁止
+
+密钥入向量 · 只信 chunk 不回读笔记 · 把 full `/help` 塞进每轮 prompt

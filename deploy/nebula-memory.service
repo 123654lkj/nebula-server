@@ -5,6 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=MALLOC_ARENA_MAX=2
+Environment=PYTHONUNBUFFERED=1
+MemoryAccounting=yes
+MemoryHigh=280M
+MemoryMax=400M
+TasksMax=64
 WorkingDirectory=/opt/nebula
 EnvironmentFile=-/opt/nebula/.env
 ExecStart=/opt/nebula/.venv/bin/python /opt/nebula/vector_memory_server.py

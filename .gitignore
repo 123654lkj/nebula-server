@@ -17,4 +17,11 @@ data/scorecard/
 # local smoke
 data/smoke_test*
 /tmp/
-
+backups/
+*.embcache.db
+data/*.backup
+data/*.bak*
+.idea/
+*.egg-info/
+dist/
+build/

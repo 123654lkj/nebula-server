@@ -21,47 +21,54 @@ import time
 import logging
 import re
 from collections import OrderedDict
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, request, jsonify, send_from_directory
+try:
+    from nebula_meta import RELEASE, EMBED_MODEL, RERANK_MODEL, PRODUCT
+except Exception:
+    RELEASE, EMBED_MODEL, RERANK_MODEL, PRODUCT = "v5.1.0", "qwen2.5-vl-embedding", "qwen3-rerank", "Nebula Memory"
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from vector_memory import (
     MemoryManager, MemoryIngestor, MemoryCompressor, Embedder, init_db, QueryRewriter,
     embedding_to_blob, content_hash,
+    classify_temporal_intent, parse_as_of,
 )
 
 # --- Logging [e9] ---
 logger = logging.getLogger("nebula.server")
 
-# --- Config (可用环境变量覆盖) ---
-DB_PATH = os.environ.get('NEBULA_DB_PATH', os.path.join(os.path.dirname(__file__), 'data', 'memory_vectors.db'))
-HOST = os.environ.get('NEBULA_HOST', '0.0.0.0')
-PORT = int(os.environ.get('NEBULA_PORT', '26670'))
+# --- Config ---
+_DEFAULT_DB = os.path.join(os.path.dirname(__file__), 'data', 'memory_vectors.db')
+DB_PATH = os.environ.get('NEBULA_DB_PATH') or _DEFAULT_DB
+NEBULA_PORT = int(os.environ.get('NEBULA_PORT', '26670'))
+NEBULA_BIND = os.environ.get('NEBULA_BIND', '0.0.0.0')
 WORKSPACE = os.path.join(os.path.dirname(__file__), '..', '..', '..')
 
 ARK_API_KEY = os.environ.get('ARK_API_KEY', '')
 MINIMAX_API_KEY = os.environ.get('MINIMAX_API_KEY', '')
 BAILIAN_API_KEY = os.environ.get('BAILIAN_API_KEY', '')
-EMBED_PROVIDER = 'qwen3vl'
+EMBED_PROVIDER = EMBED_MODEL
 
 # 百炼 qwen3-vl-embedding 配置 (2026-07-11 从 doubao 迁移)
 BAILIAN_BASE_URL = os.environ.get(
     'BAILIAN_BASE_URL',
-    'https://dashscope.aliyuncs.com/compatible-mode/v1'
+    'https://ws-lioxzt2jv93g9u38.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'
 )
-os.environ['BAILIAN_API_KEY'] = BAILIAN_API_KEY
+# 密钥只走环境 / EnvironmentFile，禁止写进源码
+if BAILIAN_API_KEY:
+    os.environ['BAILIAN_API_KEY'] = BAILIAN_API_KEY
 os.environ['BAILIAN_BASE_URL'] = BAILIAN_BASE_URL
-os.environ.setdefault('NEBULA_LLM_MODEL', 'qwen3.7-plus')  # 全链路 LLM 统一
+os.environ.setdefault('NEBULA_LLM_MODEL', 'MiniMax-M3')  # Token Plan M3
 
 if not ARK_API_KEY:
     try:
-        _ark_cfg = os.environ.get('NEBULA_ARK_CONFIG', '')
-        if _ark_cfg and os.path.isfile(_ark_cfg):
-            with open(_ark_cfg, encoding='utf-8') as f:
-                _oc = json.load(f)
-            ARK_API_KEY = _oc.get('models', {}).get('providers', {}).get('volcengine', {}).get('apiKey', '')
+        with open(os.path.expanduser('~/.openclaw/openclaw.json'), encoding='utf-8') as f:
+            _oc = json.load(f)
+        ARK_API_KEY = _oc.get('models', {}).get('providers', {}).get('volcengine', {}).get('apiKey', '')
     except Exception:
         pass
 if not MINIMAX_API_KEY:
@@ -76,7 +83,7 @@ os.environ['MINIMAX_API_KEY'] = MINIMAX_API_KEY
 class EmbeddingCache:
     """LRU + SQLite 持久化：query -> vector，重启后仍可命中。"""
 
-    def __init__(self, maxsize=2000, db_path=None):
+    def __init__(self, maxsize=512, db_path=None):
         self.cache = OrderedDict()
         self.maxsize = maxsize
         self.hits = 0
@@ -92,9 +99,6 @@ class EmbeddingCache:
                 logger.warning("emb disk cache init fail: %s", e)
 
     def _init_disk(self):
-        d = os.path.dirname(self.db_path)
-        if d and not os.path.isdir(d):
-            os.makedirs(d, exist_ok=True)
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.execute(
             """CREATE TABLE IF NOT EXISTS emb_query_cache (
@@ -123,11 +127,6 @@ class EmbeddingCache:
             row = conn.execute(
                 "SELECT vector, dim FROM emb_query_cache WHERE qkey=?", (key,)
             ).fetchone()
-            if row:
-                conn.execute(
-                    "UPDATE emb_query_cache SET access_count=access_count+1 WHERE qkey=?", (key,)
-                )
-                conn.commit()
             conn.close()
             if not row:
                 return None
@@ -214,13 +213,15 @@ class EmbeddingCache:
         }
 
 
-embedding_cache = EmbeddingCache(maxsize=2000, db_path=DB_PATH)
+# 查询向量缓存必须独立文件，禁止跟 memories 抢同一把 SQLite 锁
+_EMB_CACHE_DB = os.path.splitext(DB_PATH)[0] + ".embcache.db"
+embedding_cache = EmbeddingCache(maxsize=512, db_path=_EMB_CACHE_DB)
 
 
 class ResultCache:
     """打包后的检索结果 TTL 缓存 — 重复问题秒回，省 embed。"""
 
-    def __init__(self, maxsize=256, ttl_sec=300):
+    def __init__(self, maxsize=64, ttl_sec=300):
         self.cache = OrderedDict()
         self.maxsize = maxsize
         self.ttl = ttl_sec
@@ -278,8 +279,8 @@ result_cache = ResultCache(maxsize=512, ttl_sec=600)
 def warmup_cache(embedder, db_path=None):
     """[e8] Background warmup with dynamic hot words from DB."""
     seed_queries = [
-        "session-start", "现行架构 星枢用法 工作流", "GATEWAY_LOCK",
-        "透明代理", "mihomo", "VPS", "Hysteria", "HY2",
+        "session-start", "虎虎现行架构 星枢用法 工作流", "GATEWAY_LOCK",
+        "团子", "透明代理", "mihomo", "VPS", "Hysteria", "HY2",
         "Docker", "容器", "服务器", "配置", "星枢", "向量记忆",
         "Home Assistant", "代码", "Python", "模型", "API",
     ]
@@ -322,6 +323,27 @@ def warmup_cache(embedder, db_path=None):
 # --- Flask App ---
 
 app = Flask(__name__)
+
+
+@app.before_request
+def _nebula_gate():
+    """企业：可选 Bearer。/health /help 放行。家用未设 token 则不鉴权。"""
+    try:
+        from nebula_site import API_TOKEN
+    except Exception:
+        API_TOKEN = ""
+    if not API_TOKEN:
+        return None
+    if request.method == "OPTIONS":
+        return None
+    path = request.path or ""
+    if path in ("/health", "/help", "/v5/health") or path.startswith("/help"):
+        return None
+    auth = request.headers.get("Authorization") or ""
+    got = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if got != API_TOKEN:
+        return jsonify({"error": "unauthorized", "hint": "Authorization: Bearer <NEBULA_API_TOKEN>"}), 401
+    return None
 
 
 @app.errorhandler(Exception)
@@ -372,7 +394,7 @@ def get_engine():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'nebula-memory', 'version': 'v5.0-ultimate', 'docs': '/help', 'docs_hint': 'GET /help (mini) | /help?level=short|full — 按需取用勿默认灌上下文'})
+    return jsonify({'status': 'ok', 'service': 'nebula-memory', 'product': PRODUCT, 'version': RELEASE, 'docs': '/help', 'docs_hint': 'GET /help (mini) | /help?level=short|full'})
 
 
 # --- Search ---
@@ -458,7 +480,7 @@ def api_help():
         with open(path, encoding='utf-8') as f:
             text = f.read()
     except Exception as e:
-        text = f"help unavailable: {e}. See docs/ (repo 内)"
+        text = f"help unavailable: {e}. See /opt/nebula/docs/"
     chars = len(text)
     est = max(1, int(chars / 2.2))
     payload = {
@@ -492,7 +514,7 @@ def search():
         query = request.args.get('q', '')
         top_k = request.args.get('top_k', 5, type=int)
         rerank = request.args.get('rerank', 'false').lower() == 'true'
-        rerank_candidates = request.args.get('rerank_candidates', 5, type=int)
+        rerank_candidates = request.args.get('rerank_candidates', 8, type=int)
         category = request.args.get('category') or request.args.get('cat')
         use_hybrid = request.args.get('use_hybrid', 'true').lower() == 'true'
         explain = request.args.get('explain', 'false').lower() == 'true'
@@ -506,32 +528,40 @@ def search():
         similarity_threshold = request.args.get('similarity_threshold', 0.0, type=float)
         rewrite = request.args.get('rewrite', 'false').lower() == 'true'
         n_rewrites = request.args.get('n_rewrites', 2, type=int)
-        smart_rewrite = request.args.get('smart_rewrite', 'true').lower() == 'true'
+        smart_rewrite = request.args.get('smart_rewrite', 'false').lower() == 'true'
         pack_opts = _search_pack_params(request.args, is_get=True)
     else:
         data = request.get_json() or {}
         query = data.get('query', '')
         top_k = data.get('top_k', 5)
-        rerank = data.get('rerank', False)
-        rerank_candidates = data.get('rerank_candidates', 5)
+        rerank = _parse_bool(data.get('rerank'), False)
+        rerank_candidates = data.get('rerank_candidates', 8)
         category = data.get('category')
-        use_hybrid = data.get('use_hybrid', True)
-        explain = data.get('explain', False)
-        enable_time_decay = data.get('enable_time_decay', True)
+        use_hybrid = _parse_bool(data.get('use_hybrid'), True)
+        explain = _parse_bool(data.get('explain'), False)
+        enable_time_decay = _parse_bool(data.get('enable_time_decay'), True)
         time_decay_lambda = data.get('time_decay_lambda', 0.05)
-        use_cache = data.get('use_cache', True)
+        use_cache = _parse_bool(data.get('use_cache'), True)
         date_from = data.get('date_from')
         date_to = data.get('date_to')
         project_name = data.get('project_name')
         location = data.get('location')
         similarity_threshold = data.get('similarity_threshold', 0.0)
-        rewrite = data.get('rewrite', False)
+        rewrite = _parse_bool(data.get('rewrite'), False)
         n_rewrites = data.get('n_rewrites', 2)
-        smart_rewrite = data.get('smart_rewrite', True)
+        smart_rewrite = _parse_bool(data.get('smart_rewrite'), False)
         pack_opts = _search_pack_params(data, is_get=False)
 
-    if not query:
+    image_q = None
+    if request.method == 'POST':
+        image_q = data.get('image') or data.get('image_url')
+        if (not image_q) and request.files and request.files.get('image'):
+            image_q = request.files.get('image').read()
+    if not query and not image_q:
         return jsonify({'error': 'query is required'}), 400
+    if not query and image_q:
+        query = '[image-query]'
+        use_hybrid = False
 
     mm = get_engine()
     t0 = time.time()
@@ -600,6 +630,7 @@ def search():
 
     _rc_key = result_cache.make_key("search", {
         "q": query, "top_k": top_k, "cat": category, "hybrid": use_hybrid,
+        "rerank": rerank, "rerank_candidates": rerank_candidates,
         "pack": pack_opts.get("pack"), "compact": pack_opts.get("compact"),
         "max_chars": pack_opts.get("max_chars"), "per_source": pack_opts.get("per_source"),
         "drop_s": pack_opts.get("drop_superseded"), "drop_h": pack_opts.get("drop_hearsay_if_canon"),
@@ -698,6 +729,7 @@ def ask_memory():
         no_cache = request.args.get('no_cache', 'false').lower() == 'true'
         engine = request.args.get('engine', 'ultimate')
         use_graph = request.args.get('use_graph', 'true').lower() == 'true'
+        reader_in = request.args.get('reader')
     else:
         data = request.get_json() or {}
         query = data.get('query') or data.get('q') or ''
@@ -710,26 +742,76 @@ def ask_memory():
         no_cache = _parse_bool(data.get('no_cache'), False)
         engine = data.get('engine', 'ultimate')
         use_graph = _parse_bool(data.get('use_graph'), True)
+        reader_in = data.get('reader')
 
-    if not query:
+    # 时间意图 / 分层 prefer：可显式传入，否则规则推断（无时间词=neutral）
+    if request.method == 'GET':
+        temporal_intent = request.args.get('temporal_intent')
+        as_of_raw = request.args.get('as_of')
+        layer_raw = request.args.get('memory_layer')
+    else:
+        data_t = request.get_json(silent=True) or {}
+        temporal_intent = data_t.get('temporal_intent')
+        as_of_raw = data_t.get('as_of')
+        layer_raw = data_t.get('memory_layer') or data_t.get('prefer_layers')
+    as_of = parse_as_of(as_of_raw)
+    if not temporal_intent:
+        temporal_intent = classify_temporal_intent(query)
+    prefer_layers = None
+    if isinstance(layer_raw, list):
+        prefer_layers = [str(x) for x in layer_raw if x]
+    elif isinstance(layer_raw, str) and layer_raw.strip():
+        prefer_layers = [x.strip() for x in layer_raw.split(",") if x.strip()]
+    # 不自动推断 layer：家用题「怎么用」会被当成 procedural 把 SOP 挤掉。
+    # 调用方要分层时显式传 memory_layer。
+    try:
+        from nebula_site import resolve_tenant, REQUIRE_TENANT
+    except Exception:
+        resolve_tenant = lambda x=None: (x or "")
+        REQUIRE_TENANT = False
+    tenant_hdr = request.headers.get("X-Nebula-Tenant")
+    if request.method == "POST":
+        tenant_body = (request.get_json(silent=True) or {}).get("tenant_id")
+    else:
+        tenant_body = request.args.get("tenant_id")
+    tenant_id = resolve_tenant(tenant_body or tenant_hdr)
+    if REQUIRE_TENANT and not tenant_id:
+        return jsonify({"error": "tenant_id required"}), 400
+
+    image_q = None
+    if request.method == 'POST':
+        _body = request.get_json(silent=True) or {}
+        image_q = _body.get('image') or _body.get('image_url')
+        if (not image_q) and request.files and request.files.get('image'):
+            image_q = request.files.get('image').read()
+    if not query and not image_q:
         return jsonify({'error': 'query is required'}), 400
+    if not query and image_q:
+        query = '[image-query]'
+        use_hybrid = False
 
     t0 = time.time()
     # llm 参数先解析，纳入 result_cache key
     llm_deep = 'auto'
     llm_answer = False  # [perf] 默认关闭润色；compose_answer 抽取式足够
+    rerank = True
+    reader = _parse_bool(reader_in, False)
     if request.method == 'GET':
         llm_deep = request.args.get('llm_deep', 'auto')
         llm_answer = request.args.get('llm_answer', 'false').lower() == 'true'
+        rerank = request.args.get('rerank', 'true').lower() != 'false'
     else:
         data_llm = request.get_json(silent=True) or {}
         llm_deep = data_llm.get('llm_deep', 'auto')
         llm_answer = _parse_bool(data_llm.get('llm_answer'), False)
+        rerank = _parse_bool(data_llm.get('rerank'), True)
 
     rc_key = result_cache.make_key("ask_v4", {
         "q": query, "top_k": top_k, "max_chars": max_chars, "max_total": max_total,
         "hybrid": use_hybrid, "cat": category, "hops": hops, "engine": engine, "graph": use_graph,
-        "llm_deep": llm_deep, "llm_answer": llm_answer,
+        "llm_deep": llm_deep, "llm_answer": llm_answer, "rerank": rerank, "reader": reader,
+        "ti": temporal_intent, "as_of": as_of, "layers": prefer_layers, "tenant": tenant_id,
+        "img": bool(image_q),
     })
     if not no_cache:
         hit = result_cache.get(rc_key)
@@ -743,11 +825,20 @@ def ask_memory():
     mm = get_engine()
     if engine in ('ultimate', 'v5', 'auto'):
         from nebula_v5 import ultimate_ask
+        pre_vec = None
+        if image_q:
+            from vector_memory import resolve_image
+            cap = None if query == '[image-query]' else query
+            pre_vec = mm.embedder.embed_image(image_q, caption=cap)
         resp = ultimate_ask(
             mm, query=query, top_k=top_k, max_chars=max_chars,
             max_total_chars=max_total, use_hybrid=use_hybrid,
             category=category, use_graph=use_graph, hops=hops,
-            llm_deep=llm_deep, llm_answer=llm_answer,
+            llm_deep=llm_deep, llm_answer=llm_answer, rerank=rerank,
+            temporal_intent=temporal_intent, as_of=as_of, prefer_layers=prefer_layers,
+            reader=reader,
+            tenant_id=tenant_id,
+            precomputed_vector=pre_vec,
         )
     elif engine == 'reflect':
         from nebula_v4 import reflect_ask
@@ -755,6 +846,8 @@ def ask_memory():
             mm, query=query, top_k=top_k, max_chars=max_chars,
             max_total_chars=max_total, use_hybrid=use_hybrid,
             category=category, use_graph=use_graph, hops=hops,
+            temporal_intent=temporal_intent, as_of=as_of, prefer_layers=prefer_layers,
+            tenant_id=tenant_id,
         )
     else:
         from vector_memory import pack_results, results_token_stats, format_ask_pack, multi_hop_search
@@ -824,20 +917,10 @@ def search_rerank():
 
     if result.get('results'):
         try:
-            from reranker import get_reranker
-            reranker = get_reranker()
-            if reranker:
-                actual_candidates = min(rerank_candidates, len(result['results']))
-                candidates = [r['content'] for r in result['results'][:actual_candidates]]
-                rerank_scores = reranker.rerank(query, candidates)
-                for r in result['results']:
-                    r['rerank_score'] = None
-                for r, s in zip(result['results'][:actual_candidates], rerank_scores):
-                    r['rerank_score'] = s
-                result['results'][:actual_candidates] = sorted(
-                    result['results'][:actual_candidates],
-                    key=lambda x: x.get('rerank_score') or 0, reverse=True,
-                )
+            from reranker import apply_rerank
+            result['results'] = apply_rerank(query, result['results'], candidates=rerank_candidates)
+            result['rerank_backend'] = 'qwen3-rerank'
+            result['rerank_model'] = __import__('os').environ.get('NEBULA_RERANK_MODEL') or 'qwen3-rerank'
         except Exception as e:
             result['rerank_error'] = str(e)
     return jsonify({'status': 'ok', **result})
@@ -848,15 +931,19 @@ def search_rerank():
 @app.route('/reranker/status', methods=['GET'])
 def reranker_status():
     try:
-        from reranker import CrossEncoderReranker
-        reranker = CrossEncoderReranker.get_instance(device="auto")
+        from reranker import get_reranker, _rerank_enabled
+        import os
+        reranker = get_reranker()
         status = {
-            'loaded': reranker.is_loaded,
-            'device': getattr(reranker, '_device', 'none'),
-            'model_path': "~/.cache/modelscope/hub/models/BAAI/bge-reranker-v2-m3",
+            'loaded': bool(reranker and reranker.is_loaded),
+            'enabled': _rerank_enabled(),
+            'backend': (reranker.backend if reranker else 'qwen3-rerank'),
+            'device': 'bailian',
+            'model': os.environ.get('NEBULA_RERANK_MODEL') or 'qwen3-rerank',
+            'chat_url': os.environ.get('NEBULA_RERANK_URL', ''),
         }
     except Exception as e:
-        status = {'loaded': False, 'device': 'none', 'error': str(e)}
+        status = {'loaded': False, 'backend': 'qwen3-rerank', 'device': 'none', 'error': str(e)}
     return jsonify(status)
 
 
@@ -978,14 +1065,37 @@ def cleanup_tags():
 
 @app.route('/memory/add', methods=['POST'])
 def add_memory():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
+    if not data and request.form:
+        data = request.form.to_dict()
     mm = get_engine()
+    try:
+        from nebula_site import resolve_tenant, REQUIRE_TENANT
+    except Exception:
+        resolve_tenant = lambda x=None: (x or "")
+        REQUIRE_TENANT = False
+    meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    meta = dict(meta)
+    tenant = resolve_tenant(data.get("tenant_id") or request.headers.get("X-Nebula-Tenant") or meta.get("tenant_id"))
+    if REQUIRE_TENANT and not tenant:
+        return jsonify({"error": "tenant_id required"}), 400
+    if tenant:
+        meta["tenant_id"] = tenant
+    image = data.get('image') or data.get('image_url') or data.get('image_path')
+    if request.files and request.files.get('image'):
+        fs = request.files.get('image')
+        image = fs.read()
+        if not meta.get("image_name"):
+            meta["image_name"] = fs.filename or "upload"
     try:
         result = mm.add(
             content=data.get('content', ''), source=data.get('source', 'api'),
             category=data.get('category'), tags=data.get('tags'),
             importance=data.get('importance', 0.5),
-            metadata=data.get('metadata'),
+            metadata=meta or None,
+            semantic_dedup=_parse_bool(data.get('semantic_dedup'), True),
+            created_at=parse_as_of(data.get('created_at')),
+            image=image,
         )
     except ValueError as e:
         msg = str(e)
@@ -998,6 +1108,109 @@ def add_memory():
             }), 400
         raise
     return jsonify({'status': 'ok', **result})
+
+
+
+
+@app.route('/memory/image/<int:memory_id>', methods=['GET'])
+def serve_memory_image(memory_id):
+    """回显入库图片。路径必须落在 NEBULA_IMAGE_DIR / data/images。"""
+    from vector_memory import image_dir
+    from flask import send_file, abort
+    mm = get_engine()
+    row = mm.conn.execute("SELECT metadata FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if not row or not row[0]:
+        return jsonify({"error": "not found"}), 404
+    try:
+        meta = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+    except Exception:
+        meta = {}
+    if (meta.get("modality") or "") != "image":
+        return jsonify({"error": "not an image memory"}), 404
+    path = meta.get("image_path") or ""
+    if not path:
+        src = meta.get("image_src") or ""
+        if src.startswith("http"):
+            return jsonify({"status": "redirect", "url": src}), 302
+        return jsonify({"error": "no image_path"}), 404
+    root = os.path.realpath(image_dir(mm.db_path))
+    real = os.path.realpath(path)
+    if not real.startswith(root + os.sep) and real != root:
+        abort(403)
+    if not os.path.isfile(real):
+        return jsonify({"error": "file missing"}), 404
+    return send_file(real, mimetype=meta.get("image_mime") or None)
+
+
+
+
+@app.route("/memory/promote", methods=["POST"])
+def promote_to_vault():
+    """把一条记忆写成 Obsidian 笔记（真理库写回）。进 06-Agent会话提炼/。"""
+    import re as _re
+    from datetime import date
+    data = request.get_json(silent=True) or {}
+    mm = get_engine()
+    mid = data.get("id")
+    title = (data.get("title") or "").strip()
+    body = (data.get("content") or "").strip()
+    src = data.get("source") or "promote"
+    if mid and not body:
+        row = mm.conn.execute(
+            "SELECT id, content, source_file, category FROM memories WHERE id=?", (mid,)
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "not_found", "id": mid}), 404
+        body = (row[1] or "").strip()
+        src = row[2] or src
+        if not title:
+            title = (body.splitlines()[0] if body else "untitled")[:40]
+    if not body:
+        return jsonify({"error": "content or id required"}), 400
+    if not title:
+        title = body.splitlines()[0][:40]
+    slug = _re.sub(r"[^\w\u4e00-\u9fff-]+", "-", title).strip("-")[:40] or "note"
+    day = date.today().isoformat()
+    dest_dir = Path("/home/huhu/obsidian-vault/notes/06-Agent会话提炼")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / ("%s-%s.md" % (day, slug))
+    n = 2
+    while dest.exists():
+        dest = dest_dir / ("%s-%s-%d.md" % (day, slug, n))
+        n += 1
+    text = (
+        "---\n"
+        "title: %s\n"
+        "date: %s\n"
+        "source: %s\n"
+        "nebula_id: %s\n"
+        "trust: source\n"
+        "---\n\n"
+        "# %s\n\n"
+        "%s\n\n"
+        "> 由星枢 /memory/promote 写回。冲突以本笔记为准。\n"
+        % (title.replace("\n", " "), day, src, mid or "", title, body)
+    )
+    dest.write_text(text, encoding="utf-8")
+    rel = "notes/06-Agent会话提炼/" + dest.name
+    vault_key = "vault:" + rel
+    try:
+        added = mm.add(
+            content="[虎虎笔记] path=%s source=%s title=%s\n回读命令: rxt read --host huhu \"%s\"\n---\n%s"
+            % (rel, vault_key, title, dest.as_posix(), body[:4000]),
+            source=vault_key,
+            category="lesson",
+            importance=0.8,
+            semantic_dedup=False,
+        )
+    except Exception as e:
+        added = {"error": str(e)}
+    return jsonify({
+        "status": "ok",
+        "path": str(dest),
+        "vault_key": vault_key,
+        "nebula": added,
+    })
 
 
 @app.route('/memory/<int:memory_id>', methods=['DELETE'])
@@ -1463,21 +1676,12 @@ def v4_reflect():
 
 # ==================== MCP Server [e10] ==========================
 
-try:
-    from mcp.server.fastmcp import FastMCP
-    mcp_server = FastMCP(name='nebula-memory')
-except ImportError:
-    mcp_server = None
-    logger.info("mcp 库未安装，跳过 MCP 工具注册（REST API 不受影响）")
+from mcp.server.fastmcp import FastMCP
+
+mcp_server = FastMCP(name='nebula-memory')
 
 
-def _mcp_tool(fn):
-    """mcp_server 可用时注册为 MCP 工具，否则原样返回"""
-    if mcp_server is not None:
-        return mcp_server.tool()(fn)
-    return fn
-
-@_mcp_tool
+@mcp_server.tool()
 def search_memories(query: str, top_k: int = 5, category: str = None):
     """语义检索（pack 省 token）。优先 ask_memories。"""
     mm = get_engine()
@@ -1490,7 +1694,7 @@ def search_memories(query: str, top_k: int = 5, category: str = None):
     return {'status': 'ok', 'results': packed, 'count': len(packed), 'compact': True}
 
 
-@_mcp_tool
+@mcp_server.tool()
 def ask_memories(query: str, top_k: int = 5):
     """省 token 终极问答（v5 ultimate）。Agent 优先调用。"""
     mm = get_engine()
@@ -1498,11 +1702,7 @@ def ask_memories(query: str, top_k: int = 5):
     return ultimate_ask(mm, query=query, top_k=top_k, hops=2, use_graph=True, llm_deep='auto', llm_answer=False)
 
 
-@_mcp_tool
-
-@_mcp_tool
-
-@_mcp_tool
+@mcp_server.tool()
 def session_extract_memories(transcript: str, focus: str = "", dry_run: bool = False):
     """Mem0型：从会话文本抽取记忆并写入星枢（自动拦密钥）。"""
     mm = get_engine()
@@ -1510,13 +1710,14 @@ def session_extract_memories(transcript: str, focus: str = "", dry_run: bool = F
     return session_extract(mm, transcript=transcript, focus=focus, dry_run=dry_run, auto_write=not dry_run)
 
 
-@_mcp_tool
+@mcp_server.tool()
 def layered_recall(focus: str = ""):
     """Letta纪律：返回记忆分层调用步骤。"""
     from nebula_session_extract import layered_recall_plan
     return layered_recall_plan(focus)
 
 
+@mcp_server.tool()
 def bootstrap_memories(focus_query: str = "", budget_chars: int = 2400):
     """会话启动记忆注入包（L0）。"""
     mm = get_engine()
@@ -1524,6 +1725,7 @@ def bootstrap_memories(focus_query: str = "", budget_chars: int = 2400):
     return bootstrap_context(mm, focus_query=focus_query, budget_chars=budget_chars)
 
 
+@mcp_server.tool()
 def related_memories(memory_id: int, limit: int = 8):
     """记忆关系邻居。"""
     mm = get_engine()
@@ -1531,7 +1733,7 @@ def related_memories(memory_id: int, limit: int = 8):
     return {'status': 'ok', 'id': memory_id, 'related': related_ids(mm.conn, memory_id, limit=limit)}
 
 
-@_mcp_tool
+@mcp_server.tool()
 def supersede_memory_tool(old_id: int, new_id: int = None, note: str = ''):
     """标记旧记忆 superseded。"""
     mm = get_engine()
@@ -1539,7 +1741,7 @@ def supersede_memory_tool(old_id: int, new_id: int = None, note: str = ''):
     return supersede_memory(mm.conn, old_id, new_id, note=note)
 
 
-@_mcp_tool
+@mcp_server.tool()
 def add_memory_tool(content: str, importance: float = 0.5, category: str = 'fact'):
     """Add a new memory to the system."""
     mm = get_engine()
@@ -1547,7 +1749,7 @@ def add_memory_tool(content: str, importance: float = 0.5, category: str = 'fact
     return {'status': 'ok', **result}
 
 
-@_mcp_tool
+@mcp_server.tool()
 def get_memory_stats():
     """Get memory system statistics."""
     mm = get_engine()
@@ -1557,7 +1759,7 @@ def get_memory_stats():
     return {'status': 'ok', 'total_memories': total, 'categories': categories, 'db_size_bytes': db_size}
 
 
-@_mcp_tool
+@mcp_server.tool()
 def get_tags_cloud(limit: int = 20):
     """Get popular tags from the memory system."""
     mm = get_engine()
@@ -1565,7 +1767,7 @@ def get_tags_cloud(limit: int = 20):
     return [{'name': r[0], 'count': r[1]} for r in rows]
 
 
-@_mcp_tool
+@mcp_server.tool()
 def delete_memory_by_id(memory_id: int):
     """Delete a memory by its ID."""
     mm = get_engine()
@@ -1573,7 +1775,7 @@ def delete_memory_by_id(memory_id: int):
     return {'status': 'ok', 'deleted': result, 'memory_id': memory_id}
 
 
-@_mcp_tool
+@mcp_server.tool()
 def search_function(func_name: str, top_k: int = 5):
     """[e10] Search for a function by name in the memory system."""
     mm = get_engine()
@@ -1581,7 +1783,7 @@ def search_function(func_name: str, top_k: int = 5):
     return {'status': 'ok', 'results': results, 'count': len(results)}
 
 
-@_mcp_tool
+@mcp_server.tool()
 def search_class(class_name: str, top_k: int = 5):
     """[e10] Search for a class by name in the memory system."""
     mm = get_engine()
@@ -1589,7 +1791,7 @@ def search_class(class_name: str, top_k: int = 5):
     return {'status': 'ok', 'results': results, 'count': len(results)}
 
 
-@_mcp_tool
+@mcp_server.tool()
 def compress_memories(date: str = None, days_ago: int = 30):
     """Compress old memories into summaries. Specify a date or days_ago."""
     mm = get_engine()
@@ -1655,11 +1857,12 @@ def mcp_endpoint():
 
 
 if __name__ == '__main__':
-    print('=== Nebula Memory API Server v5 Ultimate ===')
-    print(f'    Port: {PORT}')
-    print(f'    DB: {DB_PATH}')
-    print(f'    Embedder: {EMBED_PROVIDER}')
-    print(f'    UI: http://127.0.0.1:{PORT}/ui')
+    print('星枢 %s  %s' % (PRODUCT, RELEASE))
+    print('  bind    %s:%s' % (NEBULA_BIND, NEBULA_PORT))
+    print('  db      %s' % DB_PATH)
+    print('  embed   %s' % EMBED_PROVIDER)
+    print('  rerank  %s' % RERANK_MODEL)
+    print('  docs    http://127.0.0.1:%s/help' % NEBULA_PORT)
 
     def _startup_warmup():
         time.sleep(1)
@@ -1675,7 +1878,7 @@ if __name__ == '__main__':
                 warmup_cache(mm.embedder, db_path=DB_PATH)
             try:
                 from nebula_v5 import bootstrap_context
-                for fq in ("session-start", "现行架构 星枢用法 工作流"):
+                for fq in ("session-start", "虎虎现行架构 星枢用法 工作流"):
                     for budget in (1200, 2400):
                         t1 = time.time()
                         resp = bootstrap_context(mm, focus_query=fq, budget_chars=budget)
@@ -1698,4 +1901,4 @@ if __name__ == '__main__':
             logger.error(f'Startup warmup failed: {e}')
 
     threading.Thread(target=_startup_warmup, daemon=True).start()
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    app.run(host=NEBULA_BIND, port=NEBULA_PORT, debug=False, threaded=True)

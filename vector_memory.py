@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,11 +40,344 @@ if not logger.handlers:
 DEFAULT_CATEGORY = "general"
 EMBEDDING_DIM = 2048  # qwen2.5-vl-embedding
 
+# ─── 时间意图 / 分层 prefer（叫板最小能力，默认中性=现网行为）────────
+_TEMPORAL_PRESENT = ("现在", "当前", "最新", "最近", "此刻", "now", "currently", "latest", "right now")
+_TEMPORAL_PAST = ("去年", "之前", "以前", "当时", "曾经", "过去", "去年的", "last year", "previously", "used to", "in the past", "before")
+_TEMPORAL_FUTURE = ("下周", "计划", "即将", "未来", "下次", "next week", "upcoming", "will ", "going to", "plan to")
+_LAYER_PROCEDURAL = ("怎么做", "步骤", "怎么用", "如何配置", "如何做", "sop", "how to", "procedure", "steps")
+_LAYER_EPISODIC = ("上次", "那次", "经过", "当时发生", "会话里", "last time", "what happened")
+_LAYER_SEMANTIC = ("是什么", "端口", "地址", "默认", "谁是", "在哪")
+
+
+def classify_temporal_intent(query: str) -> str:
+    """规则分类：present|past|future|neutral。无时间词=neutral，不改变现网衰减。"""
+    q = query or ""
+    ql = q.lower()
+    if any(k in q or k in ql for k in _TEMPORAL_PAST):
+        return "past"
+    if any(k in q or k in ql for k in _TEMPORAL_FUTURE):
+        return "future"
+    if any(k in q or k in ql for k in _TEMPORAL_PRESENT):
+        return "present"
+    return "neutral"
+
+
+def infer_prefer_layers(query: str) -> Optional[List[str]]:
+    q = query or ""
+    ql = q.lower()
+    if any(k in q or k in ql for k in _LAYER_PROCEDURAL):
+        return ["procedural"]
+    if any(k in q or k in ql for k in _LAYER_EPISODIC):
+        return ["episodic"]
+    if any(k in q or k in ql for k in _LAYER_SEMANTIC):
+        return ["semantic"]
+    return None
+
+
+def parse_as_of(val) -> Optional[float]:
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    from datetime import datetime
+    for fmt, n in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10), ("%Y/%m/%d", 10)):
+        try:
+            return datetime.strptime(s[:n], fmt).timestamp()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def temporal_weight(created_at, intent: str = "neutral", as_of: Optional[float] = None,
+                    enable: bool = True, lambda_neutral: float = 0.05) -> float:
+    """返回乘数。neutral+enable 与现网 exp(-0.05*days) 一致。"""
+    if not enable or not created_at:
+        return 1.0
+    now = float(as_of) if as_of is not None else time.time()
+    days = max(0.0, (now - float(created_at)) / 86400.0)
+    intent = (intent or "neutral").lower()
+    if intent == "past":
+        return 1.0 + 0.15 * math.log1p(days)
+    if intent == "future":
+        return 1.0
+    if intent == "present":
+        return math.exp(-0.08 * days)
+    return math.exp(-lambda_neutral * days)
+
+
+_MONTHS = (
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+)
+_DATE_SPAN = re.compile(
+    r"(?:"
+    r"\d{4}[/-]\d{1,2}[/-]\d{1,2}"
+    r"|\d{4}年\d{1,2}月\d{1,2}日"
+    r"|\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+    r"|(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?"
+    r")",
+    re.I,
+)
+
+
+def extract_dated_facts(text: str, max_facts: int = 10, as_of: Optional[float] = None) -> List[str]:
+    """兼容旧调用：返回「日期 | 句子」字符串。结构化走 extract_dated_events。"""
+    return [
+        f"{e['date']} | {e['sent']}"
+        for e in extract_dated_events(text, as_of=as_of, max_facts=max_facts)
+    ]
+
+
+def parse_date_token(raw: str, as_of: Optional[float] = None) -> Optional[datetime]:
+    """缝合 Zep 的 valid-time：相对会话日补年，不建图。"""
+    if not raw:
+        return None
+    s = re.sub(r"\s+", " ", str(raw)).strip()
+    s = re.sub(r"(?i)(st|nd|rd|th)\b", "", s).strip(" ,")
+    as_dt = datetime.fromtimestamp(as_of) if as_of else None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y年%m月%d日", "%B %d %Y", "%B %d", "%b %d %Y", "%b %d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.year == 1900 and as_dt:
+                dt = dt.replace(year=as_dt.year)
+            return dt
+        except ValueError:
+            continue
+    m = re.match(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", s)
+    if m:
+        mo, d = int(m.group(1)), int(m.group(2))
+        y = m.group(3)
+        year = int(y) if y else (as_dt.year if as_dt else datetime.now().year)
+        if y and int(y) < 100:
+            year = 2000 + int(y)
+        try:
+            dt = datetime(year, mo, d)
+        except ValueError:
+            return None
+        if as_dt and not y and dt > as_dt + timedelta(days=2):
+            try:
+                dt = datetime(year - 1, mo, d)
+            except ValueError:
+                pass
+        return dt
+    return None
+
+
+_NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "a": 1, "an": 1}
+_REL_AGO = re.compile(
+    r"(?:(\d+)|(one|two|three|four|five|six|a|an))\s+(day|days|week|weeks|month|months)\s+ago",
+    re.I,
+)
+_REL_MID = re.compile(
+    r"mid[- ]?(January|February|March|April|May|June|July|August|September|October|November|December)",
+    re.I,
+)
+
+
+def extract_dated_events(text: str, as_of: Optional[float] = None, max_facts: int = 12) -> List[Dict[str, Any]]:
+    """事件条 {date, ts, sent}。借鉴 Hindsight 日期网络，实现是正则+锚点，不抄四网。"""
+    if not text:
+        return []
+    events: List[Dict[str, Any]] = []
+    seen = set()
+
+    def _push(date_s: str, ts: Optional[datetime], a: int, b: int):
+        start = text.rfind(".", 0, a)
+        start = max(start + 1, a - 90)
+        end = text.find(".", b)
+        if end < 0:
+            end = min(len(text), b + 140)
+        sent = re.sub(r"\s+", " ", text[start:end].strip(" \n-—"))
+        if len(sent) < 8:
+            return
+        key = (date_s.lower(), sent[:72])
+        if key in seen:
+            return
+        seen.add(key)
+        events.append({
+            "date": date_s,
+            "ts": ts.timestamp() if ts else None,
+            "sent": sent[:180],
+        })
+
+    for m in _DATE_SPAN.finditer(text):
+        if re.search(r"\[session[^\n]{0,80}$", text[: m.start()], re.I):
+            continue  # 灌库头 @date，不是用户事实
+        date_s = re.sub(r"\s+", " ", m.group(0)).strip()
+        _push(date_s, parse_date_token(date_s, as_of=as_of), m.start(), m.end())
+        if len(events) >= max_facts:
+            return events
+
+    if as_of:
+        as_dt = datetime.fromtimestamp(as_of)
+        for m in _REL_AGO.finditer(text):
+            n = int(m.group(1)) if m.group(1) else _NUM_WORDS.get((m.group(2) or "").lower(), 0)
+            if not n:
+                continue
+            unit = m.group(3).lower()
+            days = n * (1 if "day" in unit else 7 if "week" in unit else 30)
+            ts = as_dt - timedelta(days=days)
+            _push(m.group(0), ts, m.start(), m.end())
+        for m in _REL_MID.finditer(text):
+            try:
+                ts = datetime.strptime(f"{m.group(1)} 15 {as_dt.year}", "%B %d %Y")
+            except ValueError:
+                continue
+            _push(m.group(0), ts, m.start(), m.end())
+    return events[:max_facts]
+
+
+def classify_temporal_op(query: str) -> str:
+    """Mem0 时间意图的算子版：只认 first/last/隔几天，不碰家用中性题。"""
+    q = (query or "").lower()
+    if any(k in q for k in ("how many days", "how many day", "多少天", "几天", "隔了", "隔几天")):
+        return "days_between"
+    if any(k in q for k in ("which", "哪个", "哪次")) and any(
+        k in q for k in ("first", "earlier", "earliest", "先", "更早", "最先")
+    ):
+        return "which_first"
+    if any(k in q for k in ("which", "哪个")) and any(k in q for k in ("last", "later", "latest", "最晚", "最后")):
+        return "which_last"
+    return ""
+
+
+def _tokset(s: str) -> List[str]:
+    stop = {
+        "the", "and", "for", "with", "that", "this", "from", "have", "been", "after",
+        "before", "how", "many", "days", "did", "take", "which", "was", "were",
+        "first", "last", "event", "attend", "between", "passed",
+    }
+    return [t for t in re.findall(r"[a-z0-9']{3,}", (s or "").lower()) if t not in stop]
+
+
+def _fact_score(ev: Dict[str, Any], phrase: str) -> int:
+    blob = f"{ev.get('sent','')} {ev.get('date','')}".lower()
+    n = 0
+    for t in _tokset(phrase):
+        alts = {t, t.rstrip("d")}
+        if t.endswith("ing") and len(t) > 5:
+            alts.add(t[:-3])
+            alts.add(t[:-3] + "ed")
+        else:
+            alts.add(t + "ing")
+            alts.add(t + "ed")
+        if any(re.search(r"\b" + re.escape(a) + r"\b", blob) for a in alts if len(a) >= 3):
+            n += 1
+    return n
+
+
+def _event_phrases(query: str) -> List[str]:
+    q = query or ""
+    found = []
+    for m in re.finditer(r"'([^']{3,80})'|\"([^\"]{3,80})\"|《([^》]{2,40})》", q):
+        found.append(next(g for g in m.groups() if g))
+    if found:
+        return found
+    m = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+?)(?:\?|$)", q, re.I)
+    if m:
+        return [m.group(1).strip(), m.group(2).strip()]
+    m = re.search(r"\bafter\s+(.+?)(?:\?|$)", q, re.I)
+    if m:
+        after = m.group(1).strip()
+        main = re.sub(r"(?i)how many days.*?(?:for me to|did i|did it take(?: for me)? to)\s+", "", q)
+        main = re.sub(r"(?i)\s+after\s+.+", "", main)
+        main = re.sub(r"(?i)how many days|did it take|\?", "", main).strip()
+        return [after, main] if main else [after]
+    return []
+
+
+def solve_temporal(query: str, events: List[Dict[str, Any]]) -> Optional[str]:
+    """用日期条做 first / 间隔。借鉴 Zep 时序，不建双时态图。"""
+    op = classify_temporal_op(query)
+    dated = [e for e in (events or []) if e.get("ts")]
+    if not op or len(dated) < 1:
+        return None
+    phrases = _event_phrases(query)
+
+    def bind(phrase: str) -> Optional[Dict[str, Any]]:
+        scored = [( _fact_score(e, phrase), e) for e in dated]
+        scored = [x for x in scored if x[0] > 0]
+        if not scored:
+            return None
+        scored.sort(key=lambda x: (-x[0], x[1]["ts"]))
+        return scored[0][1]
+
+    if op == "days_between" and len(phrases) >= 2:
+        a, b = bind(phrases[0]), bind(phrases[1])
+        if a and b and a is not b and a.get("ts") != b.get("ts"):
+            days = int(abs(float(a["ts"]) - float(b["ts"])) / 86400.0)
+            return f"{days} days"
+    if op in ("which_first", "which_last") and len(phrases) >= 2:
+        pairs = []
+        seen = set()
+        for p in phrases[:3]:
+            ev = bind(p)
+            if ev and id(ev) not in seen:
+                seen.add(id(ev))
+                pairs.append((p, ev))
+        if len(pairs) >= 2:
+            pairs.sort(key=lambda x: float(x[1]["ts"]))
+            p, _ev = pairs[0] if op == "which_first" else pairs[-1]
+            return p
+    return None
+
+
+def pin_keys_from_query(query: str) -> List[str]:
+    """query 硬锚：站点 PIN_REGEX + 书名号。默认只钉 *.md。"""
+    q = query or ""
+    keys = []
+    try:
+        from nebula_site import pin_regex
+        rx = pin_regex()
+    except Exception:
+        rx = re.compile(r"[A-Za-z0-9._-]{3,}\.md", re.I)
+    for m in rx.finditer(q):
+        keys.append(m.group(0))
+    for m in re.finditer(r"《([^》]{2,40})》", q):
+        keys.append(m.group(1))
+    out, seen = [], set()
+    for k in keys:
+        kl = k.lower()
+        if kl not in seen:
+            seen.add(kl)
+            out.append(k)
+    return out
+
+
+def pin_exact_matches(query: str, packed: List[Dict]) -> List[Dict]:
+    """rerank 之后把文件名/锁命中钉回第一。rerank 不得掀权威。"""
+    if not packed:
+        return packed
+    keys = pin_keys_from_query(query)
+    if not keys:
+        return packed
+    head, rest = [], []
+    for r in packed:
+        blob = " ".join(str(x or "") for x in (r.get("source_file"), r.get("src")))
+        # 只钉路径/文件名，不钉正文（session-extract 里提到 GATEWAY_LOCK 不能压过锁文件）
+        if any(k.lower() in blob.lower() for k in keys):
+            r = dict(r)
+            r["pinned"] = True
+            head.append(r)
+        else:
+            rest.append(r)
+    return (head + rest) if head else packed
+
+
 CATEGORY_KEYWORDS = {
     "code":       ["def ", "class ", "import ", "function ", "return ", "async ", "git ", "commit", "变量", "函数", "代码"],
     "network":    ["ip ", "tcp", "udp", "proxy", "代理", "透明代理", "mihomo", "iptables", "nftables", "dns", "vpn", "hy2", "hysteria", "xray", "sing-box"],
     "hardware":   ["树莓派", "gpu", "cpu", "内存", "usb", "硬件", "挂灯", "台灯", "旋钮", "ulanzi"],
-    "homelab":    ["docker", "容器", "compose", "home assistant", "ha ", "nas", "portainer"],
+    "homelab":    ["docker", "容器", "compose", "虎虎", "仙兔儿", "home assistant", "ha ", "nas", "portainer"],
     "todo":       ["todo", "计划", "要做", "下一步", "规划"],
     "note":       ["学了", "学习", "笔记", "心得", "记录", "总结"],
     "config":     ["配置", "设置", "config", ".json", ".yaml", ".toml", "环境变量"],
@@ -212,13 +546,134 @@ def init_db(conn: sqlite3.Connection):
     conn.commit()
 
 
+
+# ─── 图片 RAG（qwen2.5-vl-embedding 与文本同空间）────────────────
+_IMAGE_EXTS = {
+    ".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".webp": "webp",
+    ".bmp": "bmp", ".gif": "gif", ".tif": "tiff", ".tiff": "tiff",
+}
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 百炼 qwen2.5-vl-embedding 上限
+
+
+def image_dir(db_path: str = None) -> str:
+    if os.environ.get("NEBULA_IMAGE_DIR"):
+        d = os.environ["NEBULA_IMAGE_DIR"]
+    elif db_path:
+        d = os.path.join(os.path.dirname(os.path.abspath(db_path)), "images")
+    else:
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "images")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _guess_image_mime(name: str = "", data: bytes = b"") -> str:
+    ext = os.path.splitext((name or "").split("?")[0])[1].lower()
+    if ext in _IMAGE_EXTS:
+        return "image/" + _IMAGE_EXTS[ext]
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/jpeg"
+
+
+def resolve_image(image, persist_dir: str = None) -> Dict[str, Any]:
+    """把 url / data URI / 本地路径 收成可送百炼 + 可落盘的结构。"""
+    import base64
+    import urllib.request
+
+    if image is None or image == "":
+        raise ValueError("image 为空")
+    raw_bytes = b""
+    mime = "image/jpeg"
+    name = "image.jpg"
+    src_url = ""
+    data_uri = ""
+
+    if isinstance(image, (bytes, bytearray)):
+        raw_bytes = bytes(image)
+        mime = _guess_image_mime(data=raw_bytes)
+        data_uri = "data:%s;base64,%s" % (mime, base64.b64encode(raw_bytes).decode("ascii"))
+    else:
+        s = str(image).strip()
+        if s.startswith("data:image/"):
+            header, b64 = s.split(",", 1)
+            mime = header[5:].split(";")[0] or "image/jpeg"
+            raw_bytes = base64.b64decode(b64)
+            data_uri = s
+            name = "image." + (mime.split("/")[-1] or "jpg")
+        elif s.startswith("http://") or s.startswith("https://"):
+            src_url = s
+            name = os.path.basename(s.split("?")[0]) or "image.jpg"
+            req = urllib.request.Request(s, headers={"User-Agent": "nebula-image/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw_bytes = resp.read(_MAX_IMAGE_BYTES + 1)
+            mime = _guess_image_mime(name, raw_bytes)
+            # 百炼可直接吃公网 URL；本地副本用于回显
+            data_uri = s
+        else:
+            p = os.path.abspath(s)
+            if not os.path.isfile(p):
+                raise ValueError("图片文件不存在: %s" % s)
+            with open(p, "rb") as f:
+                raw_bytes = f.read(_MAX_IMAGE_BYTES + 1)
+            name = os.path.basename(p)
+            mime = _guess_image_mime(name, raw_bytes)
+            data_uri = "data:%s;base64,%s" % (mime, base64.b64encode(raw_bytes).decode("ascii"))
+
+    if not raw_bytes:
+        raise ValueError("读不到图片字节")
+    if len(raw_bytes) > _MAX_IMAGE_BYTES:
+        raise ValueError("图片超过 5MB（qwen2.5-vl-embedding 上限）")
+
+    stored = ""
+    if persist_dir:
+        os.makedirs(persist_dir, exist_ok=True)
+        ext = _IMAGE_EXTS.get(os.path.splitext(name)[1].lower(), mime.split("/")[-1] or "jpg")
+        if ext == "jpeg":
+            ext = "jpg"
+        digest = hashlib.sha256(raw_bytes).hexdigest()[:16]
+        stored = os.path.join(persist_dir, "%s.%s" % (digest, ext))
+        if not os.path.exists(stored):
+            with open(stored, "wb") as f:
+                f.write(raw_bytes)
+
+    return {
+        "bytes": raw_bytes,
+        "mime": mime,
+        "name": name,
+        "data_uri": data_uri,
+        "src_url": src_url,
+        "path": stored,
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+    }
+
+
+def image_meta_fields(resolved: Dict[str, Any], memory_id: int = None) -> Dict[str, Any]:
+    out = {
+        "modality": "image",
+        "image_path": resolved.get("path") or "",
+        "image_mime": resolved.get("mime") or "",
+        "image_name": resolved.get("name") or "",
+    }
+    if resolved.get("src_url"):
+        out["image_src"] = resolved["src_url"]
+    if memory_id:
+        out["image_url"] = "/memory/image/%s" % memory_id
+    return out
+
+
 # ─── Embedder ────────────────────────────────────────────────────────────
 
 
 # ─── Token 友好结果打包（Agent 默认路径）──────────────────────────────
 
 _VAULT_HEADER_RE = re.compile(
-    r"^\[笔记\][^\n]*\n?",
+    r"^\[虎虎笔记\][^\n]*\n?",
     re.MULTILINE,
 )
 _NOISE_KEYS = (
@@ -340,12 +795,77 @@ def pack_results(
     drop_hearsay_if_canon: bool = True,
     compact: bool = True,
     min_score: float = 0.0,
+    max_synthesis: int = 1,
+    prefer_layers: Optional[List[str]] = None,
 ) -> List[Dict]:
     """把原始检索结果压成 Agent 友好、省 token 的列表。"""
     if not results:
         return []
 
     ordered = sorted(results, key=lambda x: float(x.get("score") or 0), reverse=True)
+    qlow = (query or "").lower()
+    if any(k in (query or "") or k in qlow for k in ("图片", "照片", "截图", "这张图", "图里", "看图", "image", "photo", "screenshot")):
+        def _is_img(r):
+            meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+            return r.get("modality") == "image" or meta.get("modality") == "image"
+        ordered = sorted(ordered, key=lambda r: (1 if _is_img(r) else 0, float(r.get("score") or 0)), reverse=True)
+    pref = {str(x).lower() for x in (prefer_layers or []) if x}
+    if pref:
+        def _layer_of(r):
+            meta = r.get("metadata")
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            return (meta.get("memory_layer") or r.get("memory_layer") or "").strip().lower()
+
+        ordered = sorted(
+            ordered,
+            key=lambda r: (
+                1 if _layer_of(r) in pref else 0,
+                float(r.get("score") or 0),
+            ),
+            reverse=True,
+        )
+
+    def _src_of(r):
+        return r.get("source_file") or r.get("src") or ""
+
+    def _is_vault(r):
+        s = str(_src_of(r) or "")
+        return (
+            s.startswith("vault:")
+            or s.startswith("notes/")
+            or s.startswith("gateway/")
+            or "/opt/gateway/" in s
+        )
+
+    def _is_scratch(r):
+        s = _src_of(r)
+        try:
+            from nebula_site import is_scratch_src
+            return is_scratch_src(s)
+        except Exception:
+            return s in ("session-extract", "minimax-auto-sync") or "SESSIONS/" in s
+
+    wants_session = any(
+        k in (query or "")
+        for k in ("上次", "刚才", "那次会", "会话里", "会话说", "session-extract", "提炼报告")
+    )
+    has_vault = any(_is_vault(r) for r in ordered[: max(top_k * 4, 16)])
+    if has_vault and not wants_session:
+        kept = [r for r in ordered if _is_vault(r) or not _is_scratch(r)]
+        if kept:
+            ordered = kept
+        # 同分时笔记压过碎片
+        ordered = sorted(
+            ordered,
+            key=lambda r: (2 if _is_vault(r) else 0, float(r.get("score") or 0)),
+            reverse=True,
+        )
 
     if drop_superseded:
         ordered = [r for r in ordered if r.get("trust") != "superseded"]
@@ -362,7 +882,7 @@ def pack_results(
             if t == "hearsay":
                 continue
             if t == "synthesis":
-                if synth_kept >= 1:
+                if synth_kept >= max(1, int(max_synthesis or 1)):
                     continue
                 synth_kept += 1
             filtered.append(r)
@@ -375,7 +895,7 @@ def pack_results(
     for r in ordered:
         src = r.get("source_file") or f"id:{r.get('id')}"
         key = src
-        if src in ("manual", "grok", "api", "hermes", None, ""):
+        if src in ("manual", "grok", "api", "hermes", "session-extract", "tuanzi-distill", None, ""):
             key = f"id:{r.get('id')}"
         hit = _query_hit_score(r.get("content") or "", query)
         score = float(r.get("score") or 0)
@@ -399,7 +919,7 @@ def pack_results(
     for r in ordered:
         src = r.get("source_file") or f"id:{r.get('id')}"
         key = src
-        if src in ("manual", "grok", "api", "hermes", None, ""):
+        if src in ("manual", "grok", "api", "hermes", "session-extract", "tuanzi-distill", None, ""):
             key = f"id:{r.get('id')}"
         chosen = best_by_src.get(key)
         if not chosen or chosen.get("id") != r.get("id"):
@@ -424,12 +944,46 @@ def pack_results(
         item = dict(r)
         full = item.get("content") or ""
         snippet = extract_snippet(full, query, max_chars=max_chars)
+        # L0：metadata.abstract / content_preview 优先（省 token）
+        meta = item.get("metadata")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        abstract = (meta.get("abstract") or item.get("abstract") or item.get("content_preview") or "").strip()
+        layer = (meta.get("memory_layer") or item.get("memory_layer") or "").strip()
+        if abstract and abstract == full[: len(abstract)]:
+            # preview 只是截断正文时不当真 L0
+            if not meta.get("abstract"):
+                abstract = ""
+        use_abs = False
+        if abstract and compact:
+            hit_abs = _query_hit_score(abstract, query) if query else 1.0
+            hit_snip = _query_hit_score(snippet, query) if query else 0.0
+            # 摘要命中够用，或无 query 时优先短摘要
+            if (not query) or hit_abs >= hit_snip * 0.85 or hit_abs >= 1.0:
+                use_abs = True
         if compact:
-            item["content"] = snippet
-            item["content_chars"] = len(snippet)
+            body = (abstract[:max_chars] if use_abs else snippet)
+            if layer and use_abs:
+                body = f"[{layer[0]}] {body}" if not body.startswith("[") else body
+            kept_created = item.get("created_at")
+            item["full"] = full[:6000]
+            item["dated_facts"] = extract_dated_events(full, as_of=kept_created)
+            item["content"] = body
+            item["content_chars"] = len(body)
             item["full_chars"] = len(full)
+            if abstract:
+                item["abstract"] = abstract[:120]
+            if layer:
+                item["memory_layer"] = layer
             for k in _NOISE_KEYS:
                 item.pop(k, None)
+            if kept_created is not None:
+                item["created_at"] = kept_created
             sf = item.get("source_file") or ""
             if sf.startswith("vault:"):
                 item["src"] = sf[len("vault:"):]
@@ -441,6 +995,17 @@ def pack_results(
             item["content"] = snippet if len(full) > max_chars * 2 else full
             item["content_chars"] = len(item["content"])
             item["full_chars"] = len(full)
+            if abstract:
+                item["abstract"] = abstract[:120]
+            if layer:
+                item["memory_layer"] = layer
+        if (meta.get("modality") or item.get("modality")) == "image":
+            item["modality"] = "image"
+            mid = item.get("id")
+            if mid:
+                item["image_url"] = "/memory/image/%s" % mid
+            if meta.get("image_name"):
+                item["image_name"] = meta.get("image_name")
         packed.append(item)
     return packed
 
@@ -659,11 +1224,12 @@ class Embedder:
         http = self._get_http()
         if http and http is not False:
             try:
+                # 短超时：闲置后 Session 复用死连接会卡满 timeout，旧值 12s 等于一次搜索假死
                 resp = http.post(
                     self.MULTIMODAL_EMBED_URL,
                     headers={"Authorization": f"Bearer {api_key}"},
                     json=payload_obj,
-                    timeout=12,
+                    timeout=(2.0, 5.0),
                 )
                 if resp.status_code != 200:
                     raise RuntimeError(f"Embedding API HTTP {resp.status_code}: {resp.text[:300]}")
@@ -671,7 +1237,8 @@ class Embedder:
             except RuntimeError:
                 raise
             except Exception as e:
-                logger.warning("requests embed fail, fallback urllib: %s", e)
+                logger.warning("requests embed fail, retry urllib: %s", e)
+                self._http = None
                 body = None
         if body is None:
             import urllib.request
@@ -687,7 +1254,7 @@ class Embedder:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=12) as resp:
+                with urllib.request.urlopen(req, timeout=6) as resp:
                     body = _json.loads(resp.read())
             except urllib.error.HTTPError as e:
                 err = e.read().decode("utf-8", errors="replace")
@@ -739,6 +1306,17 @@ class Embedder:
             logger.warning(f"Embedder 预热失败: {e}")
             return False
 
+    def embed_image(self, image, caption: str = None) -> "np.ndarray":
+        """图片或 图+文融合。与 embed(text) 同一 2048 维空间，可文搜图。"""
+        resolved = image if isinstance(image, dict) and image.get("data_uri") else resolve_image(image)
+        contents = []
+        cap = (caption or "").strip()
+        if cap:
+            contents.append({"text": cap[:2000]})
+        contents.append({"image": resolved["data_uri"]})
+        vecs = self._call_api(contents)
+        return np.array(vecs[0], dtype=np.float32)
+
 
 # ─── 连接池 [e4] ─────────────────────────────────────────────────────────
 
@@ -759,8 +1337,8 @@ class ConnectionPool:
             conn.execute("PRAGMA busy_timeout=5000")
             # [perf2] WAL + 大 cache/mmap
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA cache_size=-65536")
-            conn.execute("PRAGMA mmap_size=268435456")
+            conn.execute("PRAGMA cache_size=-8192")
+            conn.execute("PRAGMA mmap_size=33554432")
             conn.execute("PRAGMA temp_store=MEMORY")
             self._local.conn = conn
             with self._lock:
@@ -786,13 +1364,12 @@ class MemoryManager:
         self.db_path = db_path or os.path.join(os.path.dirname(__file__), 'data', 'memory_vectors.db')
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
-        # [e4] 连接池
+        # [e4] 连接池。conn 必须是 property，否则 hybrid 线程全挤主连接
         self._pool = ConnectionPool(self.db_path)
-        self.conn = self._pool.get()  # 主线程连接
-        init_db(self.conn)
+        init_db(self._pool.get())
         try:
             from nebula_v4 import migrate_schema
-            migrate_schema(self.conn)
+            migrate_schema(self._pool.get())
         except Exception as _e:
             logger.warning(f"v4 migrate skip: {_e}")
 
@@ -818,6 +1395,10 @@ class MemoryManager:
         self._cache = None
 
         logger.info(f"星枢 v4 初始化完成 | DB: {self.db_path}")
+
+    @property
+    def conn(self):
+        return self._pool.get()
 
     # ─── 嵌入矩阵管理 [e2] ─────────────────────────────────────────────
 
@@ -919,6 +1500,15 @@ class MemoryManager:
         self._reranker_loaded = True
         return self._reranker
 
+    def _apply_rerank(self, query: str, results: List[Dict], rerank_candidates: int = 8) -> List[Dict]:
+        """qwen3-rerank 精排。hybrid/向量共用。"""
+        try:
+            from reranker import apply_rerank
+            return apply_rerank(query, results, candidates=rerank_candidates)
+        except Exception as e:
+            logger.warning(f"Rerank 失败: {e}")
+            return results
+
     # ─── 向量搜索 ─────────────────────────────────────────────────────
 
     def search(self, query: str, top_k: int = 10, category: str = None,
@@ -932,23 +1522,33 @@ class MemoryManager:
                # 层级搜索参数
                level: int = None, node_type: str = None, node_name: str = None,
                source_file: str = None, line_range: Tuple[int, int] = None,
+               temporal_intent: str = None, as_of: float = None,
+               tenant_id: str = None,
                ) -> List[Dict]:
         """
         向量搜索 — 核心方法
         支持: 分类过滤、时间衰减、层级搜索、hybrid 混合搜索
         """
-        if not query and not source_file:
+        if not query and not source_file and precomputed_vector is None:
             return []
 
         # hybrid 模式 → 走 _hybrid_search（透传 precomputed 避免重复 embed）
         if use_hybrid:
-            return self._hybrid_search(
-                query, top_k=top_k,
+            fetch_k = max(top_k * 2, int(rerank_candidates or 8)) if rerank else top_k
+            results = self._hybrid_search(
+                query, top_k=fetch_k,
                 enable_time_decay=enable_time_decay,
                 time_decay_lambda=time_decay_lambda,
                 explain=explain,
                 precomputed_vector=precomputed_vector,
+                temporal_intent=temporal_intent,
+                as_of=as_of,
+                category=category,
+                tenant_id=tenant_id,
             )
+            if rerank:
+                results = self._apply_rerank(query, results, rerank_candidates)
+            return results[:top_k]
 
         # 1. 获取查询向量
         if precomputed_vector is not None:
@@ -999,7 +1599,8 @@ class MemoryManager:
         placeholders = ",".join("?" * len(candidate_ids))
         sql = f"""
             SELECT id, content, category, importance, created_at, source_file,
-                   level, node_type, node_name, project_name, location, metadata
+                   level, node_type, node_name, project_name, location, metadata,
+                   content_preview
             FROM memories
             WHERE id IN ({placeholders}) AND is_compressed = 0
         """
@@ -1010,6 +1611,9 @@ class MemoryManager:
         if category:
             filters.append("category = ?")
             params.append(category)
+        if tenant_id:
+            filters.append("json_extract(ifnull(metadata,'{}'), '$.tenant_id') = ?")
+            params.append(tenant_id)
         if level is not None:
             filters.append("level = ?")
             params.append(level)
@@ -1056,18 +1660,31 @@ class MemoryManager:
             if mid not in db_rows:
                 continue
             row = db_rows[mid]
-            _, content, cat, importance, created_at, src_file, lvl, n_type, n_name, proj, loc, meta_json = row
+            # id, content, cat, imp, created, src, lvl, ntype, nname, proj, loc, meta, preview?
+            content = row[1]
+            cat = row[2]
+            importance = row[3]
+            created_at = row[4]
+            src_file = row[5]
+            lvl = row[6]
+            n_type = row[7]
+            n_name = row[8]
+            proj = row[9]
+            loc = row[10]
+            meta_json = row[11] if len(row) > 11 else None
+            content_preview = row[12] if len(row) > 12 else None
 
             score = float(raw_score)
             if score < similarity_threshold:
                 continue
 
-            # 时间衰减
-            time_decay = 1.0
-            if enable_time_decay and created_at:
-                days = (now - created_at) / 86400.0
-                time_decay = math.exp(-time_decay_lambda * days)
-                score *= time_decay
+            # 时间衰减（neutral 与现网 λ=0.05 一致）
+            time_decay = temporal_weight(
+                created_at, intent=temporal_intent or "neutral",
+                as_of=as_of, enable=enable_time_decay,
+                lambda_neutral=time_decay_lambda,
+            )
+            score *= time_decay
 
             result = {
                 "id": mid,
@@ -1078,6 +1695,25 @@ class MemoryManager:
                 "created_at": created_at,
                 "source_file": src_file,
             }
+            if content_preview:
+                result["content_preview"] = content_preview
+            # 解析 metadata → abstract / memory_layer 上浮
+            if meta_json:
+                try:
+                    _md = json.loads(meta_json) if isinstance(meta_json, str) else meta_json
+                except Exception:
+                    _md = {}
+                if isinstance(_md, dict):
+                    result["metadata"] = _md
+                    if _md.get("abstract"):
+                        result["abstract"] = _md.get("abstract")
+                    if _md.get("memory_layer"):
+                        result["memory_layer"] = _md.get("memory_layer")
+                    if (_md.get("modality") or "") == "image":
+                        result["modality"] = "image"
+                        result["image_url"] = "/memory/image/%s" % result.get("id")
+                        if _md.get("image_path"):
+                            result["image_path"] = _md.get("image_path")
             if lvl is not None:
                 result["level"] = lvl
             if n_type:
@@ -1103,23 +1739,9 @@ class MemoryManager:
         # 8.5 权威加权（vault/importance/SUPERSEDED）— 纯向量路径也生效
         results = self._apply_authority_boost(results, explain=explain)
 
-        # 9. Rerank (可选)
-        if rerank and len(results) > 1:
-            reranker = self._get_reranker()
-            if reranker:
-                actual_k = min(rerank_candidates, len(results))
-                candidates_text = [r["content"] for r in results[:actual_k]]
-                try:
-                    rerank_scores = reranker.rerank(query, candidates_text)
-                    for r, rs in zip(results[:actual_k], rerank_scores):
-                        r["rerank_score"] = rs
-                    results[:actual_k] = sorted(
-                        results[:actual_k],
-                        key=lambda x: x.get("rerank_score", 0),
-                        reverse=True,
-                    )
-                except Exception as e:
-                    logger.warning(f"Rerank 失败: {e}")
+        # 9. Rerank（qwen3-rerank；hybrid 路径已在上方处理）
+        if rerank:
+            results = self._apply_rerank(query, results, rerank_candidates)
 
         return results[:top_k]
 
@@ -1128,7 +1750,7 @@ class MemoryManager:
 
     def _apply_authority_boost(self, results: List[Dict], explain: bool = False) -> List[Dict]:
         """权威加权：importance + vault/gateway 提升 + SUPERSEDED/过时降权。
-        来自知识库落地：The_Forest 可信度分层 + vault 为 L1 权威。
+        来自团子学习落地：The_Forest 可信度分层 + vault 为 L1 权威。
         """
         if not results:
             return results
@@ -1215,21 +1837,36 @@ class MemoryManager:
             elif imp < 0.5:
                 mult *= 0.85
 
-            # vault / gateway 权威
-            if src.startswith("vault:gateway/") or "GATEWAY_LOCK" in src:
-                mult *= 1.55
+            # 权威分层：规则来自 nebula_site（环境变量），不写死某实验室
+            try:
+                from nebula_site import is_canon_src, is_demote_src, is_hearsay_src, is_scratch_src
+            except Exception:
+                is_canon_src = lambda s: s.startswith("vault:gateway/") or "notes/HOME.md" in s
+                is_demote_src = lambda s: "/04-" in s or "/05-" in s
+                is_hearsay_src = lambda s: "SESSIONS/" in s or s == "session-extract"
+                is_scratch_src = lambda s: s in ("session-extract", "minimax-auto-sync") or "SESSIONS/" in s
+            if is_hearsay_src(src) or is_scratch_src(src):
+                trust = "hearsay"
+                if not is_canon_src(src):
+                    mult *= 0.55
+            if is_canon_src(src):
+                mult *= 1.55 if src.startswith("vault:gateway/") else 1.4
                 trust = "canon"
-            elif src.startswith("vault:notes/01-") or src.startswith("vault:notes/02-"):
-                mult *= 1.4
-                trust = "canon"
+            elif is_demote_src(src):
+                mult *= 1.08
+                if trust == "canon":
+                    trust = "source"
             elif src.startswith("vault:"):
-                mult *= 1.3
-                trust = "canon"
-            elif "SESSIONS/" in src or src.startswith("sessions/"):
+                mult *= 1.12
+                if trust == "canon":
+                    trust = "source"
+            elif is_hearsay_src(src):
                 mult *= 0.75
                 trust = "hearsay"
-            elif src in ("manual", "grok", "api", "hermes") or not src:
+            elif src in ("manual", "grok", "api", "hermes", "session-extract") or not src:
                 trust = "source" if imp >= 0.85 else "synthesis"
+                if src == "session-extract" and imp >= 0.75:
+                    mult *= 1.08  # 抽取链路（v6 layer+abstract）略抬
 
             # 正文标记过时
             head = content[:400]
@@ -1255,6 +1892,17 @@ class MemoryManager:
                 mult *= 0.22
             r["trust"] = trust
             r["authority_mult"] = round(mult, 4)
+            if metadata_json:
+                try:
+                    _md = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+                except Exception:
+                    _md = {}
+                if isinstance(_md, dict):
+                    if not isinstance(r.get("metadata"), dict):
+                        r["metadata"] = _md
+                    if (_md.get("modality") or "") == "image":
+                        r["modality"] = "image"
+                        r["image_url"] = "/memory/image/%s" % mid
 
             old = float(r.get("score", 0) or 0)
             r["score"] = round(old * mult, 6)
@@ -1266,18 +1914,14 @@ class MemoryManager:
                 exp["final_score"] = r["score"]
                 r["explain"] = exp
 
-            # vault 回读提示
             if src.startswith("vault:"):
-                path = src[len("vault:"):]
-                _vault_root = os.environ.get("NEBULA_VAULT_ROOT", "")
-                if path.startswith("gateway/") and _vault_root:
-                    r["readback"] = f"read {os.path.join(_vault_root, 'gateway', path[len('gateway/'):])}"
-                elif path.startswith("notes/") and _vault_root:
-                    r["readback"] = f'read "{os.path.join(_vault_root, path)}"'
-                elif path.startswith("infra/") and _vault_root:
-                    r["readback"] = f'read "{os.path.join(_vault_root, "infra", path[len("infra/"):])}"'
-                else:
-                    r["readback"] = f"vault source: {src}"
+                try:
+                    from nebula_site import format_readback
+                    rb = format_readback(src)
+                except Exception:
+                    rb = src
+                if rb:
+                    r["readback"] = rb
 
         results.sort(key=lambda x: x.get("score", 0), reverse=True)
         return results
@@ -1285,7 +1929,9 @@ class MemoryManager:
 
     def _bm25_search(self, query: str, top_k: int = 10,
                      enable_time_decay: bool = True, time_decay_lambda: float = 0.05,
-                     explain: bool = False) -> List[Dict]:
+                     explain: bool = False,
+                     temporal_intent: str = None, as_of: float = None,
+                     category: str = None, tenant_id: str = None) -> List[Dict]:
         """FTS5 BM25 全文搜索"""
         if not query:
             return []
@@ -1297,30 +1943,34 @@ class MemoryManager:
         fts_query = " OR ".join(tokens)
 
         try:
-            cur = self.conn.execute(
-                """SELECT m.id, m.content, bm25(memories_fts) as score, m.created_at
+            sql = """SELECT m.id, m.content, bm25(memories_fts) as score, m.created_at
                    FROM memories_fts
                    JOIN memories m ON m.id = memories_fts.rowid
-                   WHERE memories_fts MATCH ? AND m.is_compressed = 0
-                   ORDER BY bm25(memories_fts)
-                   LIMIT ?""",
-                (fts_query, top_k * 2),
-            )
+                   WHERE memories_fts MATCH ? AND m.is_compressed = 0"""
+            params = [fts_query]
+            if category:
+                sql += " AND m.category = ?"
+                params.append(category)
+            if tenant_id:
+                sql += " AND json_extract(ifnull(m.metadata,'{}'), '$.tenant_id') = ?"
+                params.append(tenant_id)
+            sql += " ORDER BY bm25(memories_fts) LIMIT ?"
+            params.append(top_k * 2)
+            cur = self.conn.execute(sql, params)
             rows = cur.fetchall()
             if not rows:
                 return []
 
             max_abs = max(abs(r[2]) for r in rows) or 1.0
-            now = time.time()
             results = []
             for mid, content, raw_score, created_at in rows:
                 score = abs(raw_score) / max_abs
-
-                time_decay = 1.0
-                if enable_time_decay and created_at:
-                    days = (now - created_at) / 86400.0
-                    time_decay = math.exp(-time_decay_lambda * days)
-                    score *= time_decay
+                time_decay = temporal_weight(
+                    created_at, intent=temporal_intent or "neutral",
+                    as_of=as_of, enable=enable_time_decay,
+                    lambda_neutral=time_decay_lambda,
+                )
+                score *= time_decay
 
                 results.append({
                     "id": mid,
@@ -1347,10 +1997,14 @@ class MemoryManager:
                        vector_weight: float = 0.7, bm25_weight: float = 0.3,
                        enable_time_decay: bool = True, time_decay_lambda: float = 0.05,
                        explain: bool = False,
-                       precomputed_vector: np.ndarray = None) -> List[Dict]:
+                       precomputed_vector: np.ndarray = None,
+                       temporal_intent: str = None, as_of: float = None,
+                       category: str = None, tenant_id: str = None) -> List[Dict]:
         """向量 + BM25 融合搜索（RRF）+ 时间衰减 — [e7] 并行化"""
-        if not query:
+        if not query and precomputed_vector is None:
             return []
+        if not query:
+            query = "[image-query]"
 
         # [e7] 并行执行向量搜索和 BM25 搜索
         # use_cache 留给 embedder 层缓存；precomputed 可跳过 API
@@ -1360,11 +2014,15 @@ class MemoryManager:
             rerank=False, enable_time_decay=False,
             use_cache=True, explain=explain,
             precomputed_vector=precomputed_vector,
+            category=category,
+            tenant_id=tenant_id,
         )
         future_bm25 = self._search_pool.submit(
             self._bm25_search,
             query=query, top_k=top_k * 2,
             enable_time_decay=False, explain=explain,
+            category=category,
+            tenant_id=tenant_id,
         )
 
         vector_results = future_vec.result(timeout=30)
@@ -1388,7 +2046,6 @@ class MemoryManager:
             bm25_rank[mid] = rank
 
         all_ids = set(vector_rank.keys()) | set(bm25_rank.keys())
-        now = time.time()
         fused = []
         for mid in all_ids:
             v_rrf = 1.0 / (k + vector_rank.get(mid, float('inf')))
@@ -1396,11 +2053,11 @@ class MemoryManager:
             rrf_score = v_rrf + b_rrf
 
             created_at = vector_dict.get(mid, {}).get("created_at") or bm25_dict.get(mid, {}).get("created_at")
-
-            time_decay = 1.0
-            if enable_time_decay and created_at:
-                days = (now - created_at) / 86400.0
-                time_decay = math.exp(-time_decay_lambda * days)
+            time_decay = temporal_weight(
+                created_at, intent=temporal_intent or "neutral",
+                as_of=as_of, enable=enable_time_decay,
+                lambda_neutral=time_decay_lambda,
+            )
 
             original_rrf = rrf_score
             fused_score = rrf_score * time_decay
@@ -1479,10 +2136,25 @@ class MemoryManager:
             project_name: str = None, location: str = None,
             metadata: Dict[str, Any] = None,
             semantic_dedup: bool = True,
-            similarity_threshold: float = 0.95) -> Dict[str, Any]:
-        """添加记忆（支持精确去重 + 语义去重）"""
-        # 1. 精确去重（content_hash）
-        h = content_hash(content)
+            similarity_threshold: float = 0.95,
+            created_at: float = None,
+            image=None) -> Dict[str, Any]:
+        """添加记忆（支持精确去重 + 语义去重）。image=url/dataURI/路径 → 图片 RAG。"""
+        if not isinstance(metadata, dict):
+            metadata = {}
+        else:
+            metadata = dict(metadata)
+        if image is None:
+            image = metadata.pop("image", None) or metadata.pop("image_url", None) or metadata.pop("image_path", None)
+        resolved = None
+        if image:
+            resolved = resolve_image(image, persist_dir=image_dir(self.db_path))
+            if not (content or "").strip():
+                content = "[image] %s" % (resolved.get("name") or "untitled")
+            h = content_hash("image:%s\n%s" % (resolved["sha256"], content))
+        else:
+            # 1. 精确去重（content_hash）
+            h = content_hash(content)
         cur = self.conn.execute(
             "SELECT id FROM memories WHERE content_hash = ? AND is_compressed = 0", (h,)
         )
@@ -1505,8 +2177,10 @@ class MemoryManager:
         except Exception as _se:
             logger.warning(f"secret scan skip: {_se}")
 
-        # 2. 语义去重
+        # 2. 语义去重（图片按字节哈希去重，不跟文本笔记撞）
         similarity_score = 0.0
+        if resolved is not None:
+            semantic_dedup = False
         if semantic_dedup and content and content.strip():
             similar = self.search(query=content, top_k=1, category=category, use_cache=False)
             if similar and similar[0].get("score", 0) >= similarity_threshold:
@@ -1516,26 +2190,44 @@ class MemoryManager:
                 similarity_score = similar[0].get("score", 0)
 
         # 3. 写入新记忆
-        preview = content[:200]
         now = time.time()
+        created_ts = float(created_at) if created_at else now
         if category is None:
             category = _rule_based_classify(content)
-        vec = self.embedder.embed(content)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        else:
+            metadata = dict(metadata)
+        # L0 abstract → content_preview（OpenViking 风格分层交付）
+        _ab = (metadata.get("abstract") or "").strip()
+        if _ab:
+            preview = _ab[:200]
+            metadata["abstract"] = _ab[:80] if len(_ab) > 80 else _ab
+        else:
+            preview = (content or "")[:200]
+        # memory_layer 规范化
+        _ml = (metadata.get("memory_layer") or "").strip().lower()
+        if _ml in ("semantic", "episodic", "procedural"):
+            metadata["memory_layer"] = _ml
+        if resolved is not None:
+            metadata.update(image_meta_fields(resolved))
+            if category is None or category == _rule_based_classify(content):
+                category = "image"
+            # 只嵌图：与文本查询同空间，才能文搜图。说明走 BM25。
+            vec = self.embedder.embed_image(resolved, caption=None)
+        else:
+            vec = self.embedder.embed(content)
         blob = embedding_to_blob(vec)
         dim = int(len(vec))
 
         try:
             from nebula_v4 import infer_trust
             _trust = infer_trust(content, source or "", float(importance or 0.5),
-                                 (metadata or {}).get("trust") if isinstance(metadata, dict) else None)
+                                 metadata.get("trust"))
         except Exception:
             _trust = "synthesis"
-        if not isinstance(metadata, dict):
-            metadata = {}
-        else:
-            metadata = dict(metadata)
         metadata["trust"] = _trust
-        metadata_json = json.dumps(metadata)
+        metadata_json = json.dumps(metadata, ensure_ascii=False)
 
         with self._db_lock:
             try:
@@ -1548,7 +2240,7 @@ class MemoryManager:
                         project_name, location, metadata, trust
                     ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (source, h, content, preview, blob, dim, self.embedder.model,
-                     category, importance, now, now,
+                     category, importance, created_ts, now,
                      level, parent_id, line_start, line_end, node_type, node_name,
                      project_name, location, metadata_json, _trust),
                 )
@@ -1562,7 +2254,7 @@ class MemoryManager:
                         project_name, location, metadata
                     ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (source, h, content, preview, blob, dim, self.embedder.model,
-                     category, importance, now, now,
+                     category, importance, created_ts, now,
                      level, parent_id, line_start, line_end, node_type, node_name,
                      project_name, location, metadata_json),
                 )
@@ -1579,7 +2271,11 @@ class MemoryManager:
         # [e2] 增量追加到嵌入矩阵（不全量重建！）
         self._append_to_emb_matrix(mid, vec)
 
-        return {"id": mid, "is_duplicate": False, "duplicate_of": None, "similarity_score": similarity_score, "trust": _trust}
+        out = {"id": mid, "is_duplicate": False, "duplicate_of": None, "similarity_score": similarity_score, "trust": _trust}
+        if resolved is not None:
+            out["modality"] = "image"
+            out["image_url"] = "/memory/image/%s" % mid
+        return out
 
     def delete(self, memory_id: int) -> bool:
         """删除记忆"""
@@ -1665,6 +2361,12 @@ class MemoryManager:
     def import_jsonl(self, filepath: str, replace: bool = False) -> Dict[str, int]:
         added, skipped, errors = 0, 0, 0
         filepath = Path(filepath)
+        if filepath.suffix.lower() in _IMAGE_EXTS:
+            cap = section_title or filepath.name
+            r = self.manager.add(content=cap, source=str(filepath),
+                                category=category if 'category' in dir() else 'image',
+                                image=str(filepath))
+            return 0 if r.get('is_duplicate') else 1
         if not filepath.exists():
             raise FileNotFoundError(f"JSONL 文件不存在: {filepath}")
 
@@ -1838,6 +2540,12 @@ class MemoryIngestor:
         filepath = Path(filepath)
         if not filepath.exists():
             return 0
+        if filepath.suffix.lower() in _IMAGE_EXTS:
+            cap = section_title or filepath.name
+            r = self.manager.add(content=cap, source=str(filepath),
+                                 category=category or 'image', importance=importance,
+                                 image=str(filepath))
+            return 0 if r.get('is_duplicate') else 1
 
         added = 0
         seen_hashes = set()
@@ -1940,10 +2648,10 @@ class QueryRewriter:
     """LLM 查询改写器 — 全链路固定百炼 qwen3.7-plus（NEBULA_LLM_MODEL 可覆盖）"""
 
     def __init__(self, api_key: str = None, model: str = None):
-        self.api_key = api_key or os.environ.get('BAILIAN_API_KEY', '')
-        self.base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        self.api_key = api_key or os.environ.get("NEBULA_LLM_API_KEY") or os.environ.get("BAILIAN_API_KEY", "")
+        self.base_url = os.environ.get("BAILIAN_CHAT_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
         # 全链路 LLM 统一 qwen3.7-plus
-        self.model = model or os.environ.get("NEBULA_LLM_MODEL", "qwen3.7-plus")
+        self.model = model or os.environ.get("NEBULA_LLM_MODEL", "MiniMax-M3")
 
     def rewrite(self, query: str, n: int = 3) -> List[str]:
         if not self.api_key:
@@ -2080,13 +2788,13 @@ class MemoryCompressor:
 
     def _call_llm(self, prompt: str) -> str:
         # 全链路 LLM 固定 qwen3.7-plus（可用 NEBULA_LLM_MODEL 覆盖，默认 3.7）
-        api_key = os.environ.get("BAILIAN_API_KEY") or os.environ.get("DASHSCOPE_API_KEY", "")
+        api_key = os.environ.get("NEBULA_LLM_API_KEY") or os.environ.get("BAILIAN_API_KEY") or os.environ.get("DASHSCOPE_API_KEY", "")
         if not api_key:
             logger.debug("BAILIAN/DASHSCOPE API_KEY 未设置，跳过 LLM 压缩")
             return ""
         try:
             import httpx
-            model = os.environ.get("NEBULA_LLM_MODEL", "qwen3.7-plus")
+            model = os.environ.get("NEBULA_LLM_MODEL", "MiniMax-M3")
             resp = httpx.post(
                 "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},

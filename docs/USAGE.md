@@ -1,136 +1,118 @@
-# 星枢 Nebula 使用文档（full）
+# 星枢 Nebula 5.1.0
 
-> **给 Agent 的铁律**：不要把本 full 文档默认塞进 system prompt。  
-> 需要时再 `GET /help?level=short|full`。默认只用 `level=mini`（`GET /help`）。
+> Agent 不要把本 full 文档默认塞进 system prompt。默认 `GET /help`（mini）。
 
-## 1. 服务
+## 1. 产品
 
 | 项 | 值 |
 |----|-----|
-| Base URL | `http://<NEBULA_HOST>:<NEBULA_PORT>`（默认 `0.0.0.0:26670`） |
-| 版本 | v5.0-ultimate |
-| Embedding | qwen2.5-vl-embedding · 2048 维 · 百炼（`BAILIAN_API_KEY`） |
-| LLM（改写/裁决/压缩） | qwen3.7-plus（`NEBULA_LLM_MODEL`） |
-| Reranker（可选） | 本地 bge-reranker-v2-m3 |
-| 数据 | SQLite `data/memory_vectors.db`（单文件，可备份迁移） |
+| 名称 | 星枢 Nebula Memory |
+| 版本 | **5.1.0** |
+| Base | `http://192.168.31.252:26670`（仅局域网，不在团子 244） |
+| 真理库 | Obsidian：`/home/huhu/obsidian-vault/notes/` |
+| 向量 | `qwen2.5-vl-embedding` · 2048 维 · 百炼 |
+| 精排 | `qwen3-rerank`（`NEBULA_RERANK=0` 关） |
+| LLM | `NEBULA_LLM_MODEL`（改写 / 深搜 / 压缩，**不排序**） |
+| 进程 | `nebula-memory.service` |
 
-## 2. Agent 标准流程
+角色：笔记是现行正文；星枢是索引 + 门禁。冲突听笔记。
+
+## 2. Agent 流程
 
 ```
-1) 接任务 → POST /v5/bootstrap {"focus":"主题"} → 注入 bootstrap
-2) 提问   → POST /ask {"query":"...","top_k":5}
-         → 优先 contract；其次 pack；勿整表 results 全文
-3) trust=canon/source 且 composed.executable → 可执行
-4) 有 readback → 回读原文（vault root 由 NEBULA_VAULT_ROOT 配置）
-5) 重要结论 → POST /memory/add（双写自己的笔记库）
+1) POST /v5/bootstrap {"focus":"主题"}
+2) POST /ask {"query":"...","top_k":5}
+   → 优先 contract；其次 pack
+3) trust=canon/source 且 executable → 可执行
+4) 有 readback → 回读笔记原文
+5) 要长期有效 → POST /memory/promote 写回 06-Agent会话提炼/
 ```
 
-## 3. 端点一览
+## 3. 端点
 
-### 3.1 用法（本文档）
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/help` | 默认 **mini**（~300 字，省 token） |
-| GET | `/help?level=mini` | 同上 |
-| GET | `/help?level=short` | 速查 ~1KB |
-| GET | `/help?level=full` | 完整文档（长） |
-| GET | `/help?format=json` | JSON：`{level,text,chars,est_tokens,hint}` |
-
-### 3.2 检索 / 问答
-
-| 方法 | 路径 | 默认 | 返回要点 |
-|------|------|------|----------|
-| POST/GET | `/ask` | engine=ultimate | contract, pack, composed, results(compact) |
-| POST | `/v5/answer` | 同 ultimate | 同上 |
-| POST/GET | `/v5/bootstrap` | — | bootstrap 会话注入 |
-| POST/GET | `/search` | pack+compact+hybrid | results 短 snippet |
-| POST | `/search_rerank` | — | 向量+改写+rerank |
-| POST | `/v4/reflect` | — | 仅 reflect 引擎 |
-
-#### POST /ask 示例
-
-```bash
-curl -sS http://127.0.0.1:26670/ask \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"你的问题","top_k":5}'
-```
-
-重要字段：
-
-| 字段 | 含义 |
-|------|------|
-| `contract` | 裁决短文（结论/ conf / executable）**优先用** |
-| `pack` | 省 token 证据列表 |
-| `composed.executable` | 是否可当现行事实执行 |
-| `composed.confidence` | 0~1 |
-| `results[].trust` | canon/source/synthesis/hearsay/superseded |
-| `results[].readback` | 原文回读提示 |
-| `token_stats.est_tokens` | 粗估 token |
-| `result_cache_hit` | 缓存命中（热路径毫秒级） |
-
-加速：
-
-```json
-{"query":"...","llm_deep":"off","llm_answer":false}
-```
-
-### 3.3 写入 / 治理
-
-| 方法 | 路径 | body |
-|------|------|------|
-| POST | `/memory/add` | content, category, importance, source, tags? |
-| PUT | `/memory/{id}` | content?, category?, importance? |
-| DELETE | `/memory/{id}` | — |
-| POST | `/memory/supersede` | old_id, new_id?, note? |
-| GET | `/memory/{id}/related` | 关系邻居 |
-| POST | `/v5/lifecycle` | demote_days?, demote_max? |
-| POST | `/v4/migrate` | rebuild_links? |
-| GET | `/v5/health` | 成熟度/trust/links |
-
-### 3.4 其它
+### 文档
 
 | 方法 | 路径 |
 |------|------|
-| GET | `/health` |
-| GET | `/stats` |
-| GET | `/ui` |
-| POST | `/mcp` |
+| GET | `/help` mini |
+| GET | `/help?level=short` |
+| GET | `/help?level=full` |
+| GET | `/help?format=json` |
 
-## 4. 类别 category
+### 检索
 
-`ai` `code` `decision` `fact` `identity` `infrastructure` `lesson` `network` `person` `preference` `project` `security`
+| 方法 | 路径 | 要点 |
+|------|------|------|
+| POST/GET | `/ask` | contract / pack / composed |
+| POST | `/v5/bootstrap` | 会话注入 |
+| POST/GET | `/search` | compact hybrid |
+| POST | `/v4/reflect` | 仅 reflect |
 
-## 5. trust 语义
+```bash
+curl -sS http://192.168.31.252:26670/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"GATEWAY_LOCK 网络冻结","top_k":5}'
+```
+
+| 字段 | 含义 |
+|------|------|
+| `contract` | 裁决（结论 / conf / executable） |
+| `composed.executable` | 能否当现行 |
+| `results[].trust` | canon / source / synthesis / hearsay / superseded |
+| `results[].readback` | 笔记回读命令 |
+| `results[].image_url` | 图片记忆回显 |
+
+加速：`{"llm_deep":"off","llm_answer":false}`
+
+### 写入 / 治理
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/memory/add` | 索引一条；可带 `image` |
+| POST | `/memory/promote` | 写成 Obsidian 笔记 |
+| GET | `/memory/image/<id>` | 回显图片 |
+| PUT/DELETE | `/memory/<id>` | 改 / 删 |
+| POST | `/memory/supersede` | 过时标记 |
+| GET | `/v5/health` | 成熟度 / trust / vault_chunks |
+| POST | `/v5/lifecycle` | 降权 |
+| POST | `/v5/session-extract` | 会话抽取（线索，不是真理） |
+
+### 密钥（Vaultwarden）
+
+明文只进密码本。`POST /secrets/store` · `POST /secrets/get`（`reveal=true`）· `GET /secrets/status`
+
+## 4. trust
 
 | trust | 含义 | Agent |
 |-------|------|-------|
-| canon | 权威（vault/现行） | 可执行 |
-| source | 高置信人工/验证 | 可执行，宜核对 |
-| synthesis | 汇总/一般 | 需验证 |
-| hearsay | 会话碎片 | 线索 |
-| superseded | 已过时 | **禁止当现行** |
+| canon | 权威笔记 / 锁 | 可执行 |
+| source | 高置信 / 04–05 笔记 | 可执行，宜核对 |
+| synthesis | 汇总 | 需验证 |
+| hearsay | 会话碎片 | 线索；有笔记在场不得当现行 |
+| superseded | 过时 | **禁止** |
 
-## 6. 兼容旧客户端
+问「上次 / 会话里」才放行碎片。
 
-- 旧 `/search` **不断**；默认变短（compact）。要全文：`"full":true` 或 `"pack":false`
-- 旧「默认 rewrite=true」已关闭；需要：`"rewrite":true`
-- 不读 `contract` 仍可读 `results[].content`（snippet）
+## 5. 图片
 
-## 7. 禁止
+`POST /memory/add`：`image` = URL / data URI / 路径 / 文件。单张 ≤ 5MB。  
+说明写在 `content`（BM25）；向量只嵌图。问句带「图片/截图」会加搜 `category=image`。
 
-1. 把 API key / 密码写入向量  
-2. 只信 chunk 不回读原文（`vault:` source）  
-3. 把 full 文档或 search 全文默认塞进每轮上下文  
-4. 未授权改生产配置
+## 6. 禁止
 
-## 8. MCP
+1. API key / 密码写入向量  
+2. 只信 chunk、不回读 `vault:`  
+3. 把 full `/help` 或 search 全文默认塞进每轮上下文  
+4. 未授权改网关（`GATEWAY_LOCK`）
 
-- `search_memories` / `ask_pack` → 星枢 /ask  
-- `bootstrap_memories` → /v5/bootstrap  
-- `remember` → 优先直写 /memory/add  
+## 7. 运维
 
-## 9. 相关文件
+| 单元 | 作用 |
+|------|------|
+| `nebula-memory.service` | API |
+| `vault-nebula-sync.timer` | 笔记 → 索引，15 min |
+| `nebula-regression.timer` | 家用 24 题 |
+| `nebula-lifecycle.timer` | 降权 |
 
-- 本目录：`docs/`（仓库内）
-- 部署：见 README.md + install.sh
+回归：`python3 /opt/nebula/scripts/nebula_regression.py`  
+版本只改 `/opt/nebula/nebula_meta.py` 与 `VERSION`。

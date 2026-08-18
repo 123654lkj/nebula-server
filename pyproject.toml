@@ -1,0 +1,31 @@
+[project]
+name = "nebula-server"
+version = "5.1.1"
+description = "星枢 Nebula — 自托管 Agent 可信记忆服务"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "xiantuer" }]
+keywords = ["nebula", "memory", "obsidian", "rag", "agent"]
+
+[project.urls]
+Homepage = "https://github.com/123654lkj/nebula-server"
+Changelog = "https://github.com/123654lkj/nebula-server/blob/main/CHANGELOG.md"
+Issues = "https://github.com/123654lkj/nebula-server/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+  "vector_memory",
+  "vector_memory_server",
+  "nebula_v4",
+  "nebula_v5",
+  "nebula_meta",
+  "nebula_site",
+  "nebula_secrets",
+  "nebula_session_extract",
+  "reranker",
+]

@@ -27,25 +27,49 @@ class Case:
 
 
 CASES: List[Case] = [
-    # --- L1 笔记 / 同步（开源模板可答）---
-    Case("A01", "黑曜石笔记与星枢分工", "ask", {
-        "content_any": ["笔记", "vault", "权威", "星枢", "同步", "L1", "L3", "原文"],
+    # --- 权威架构 ---
+    Case("A01", "GATEWAY_LOCK 网络冻结", "ask", {
+        "min_conf": 0.5,
+        "executable": True,
+        "trust_any": ["canon"],
+        "content_any": ["冻结", "GATEWAY", "禁止", "gateway"],
     }),
-    Case("A02", "vault 如何同步到星枢", "ask", {
-        "content_any": ["同步", "白名单", "vault", "npm", "脚本"],
+    Case("A02", "phantun 主梯子架构", "ask", {
+        "min_conf": 0.4,
+        "trust_any": ["canon", "source"],
+        "content_any": ["phantun", "1080", "gw-xray", "xray"],
     }),
-    Case("A03", "星枢服务端口与健康检查", "ask", {
-        "content_any": ["26670", "health", "星枢", "nebula", "/v5"],
+    Case("A03", "星枢在哪台机器端口", "ask", {
+        "content_any": ["26670", "192.168.31.252", "虎虎", "huhu"],
     }),
-    Case("A04", "笔记和向量谁更权威", "ask", {
-        "content_any": ["笔记", "权威", "readback", "原文", "vault"],
+    Case("A04", "能不能随便改代理网关", "ask", {
+        "content_any": ["禁止", "冻结", "授权", "GATEWAY"],
     }),
-    # --- API / SOP ---
-    Case("W01", "星枢怎么用 ask bootstrap", "ask", {
-        "content_any": ["ask", "bootstrap", "pack", "contract", "help", "memory"],
+    # --- 工作流/方法论 ---
+    Case("W01", "ponytail 七级决策", "ask", {
+        "trust_any": ["canon", "source"],
+        "content_any": ["ponytail", "七级", "配置", "最小"],
     }),
-    Case("W02", "密钥能不能写进笔记或向量", "ask", {
-        "content_any": ["禁止", "密钥", "密码", "环境变量", "指针"],
+    Case("W02", "团子学习工作流落地", "ask", {
+        "content_any": ["工作流", "落地", "星枢", "笔记", "recall", "OODA", "STRACE", "五件事"],
+    }),
+    Case("W03", "星枢怎么用 ask bootstrap", "ask", {
+        "content_any": ["ask", "bootstrap", "26670", "pack", "contract", "help"],
+    }),
+    # --- 项目 ---
+    Case("P01", "torrent-panel 播放器路径", "ask", {
+        "content_any": ["torrent-panel", "8095", "播放", "v2"],
+    }),
+    # --- 密钥指针（不取明文）---
+    Case("S01", "", "secrets_status", {"unlocked": True}),
+    Case("S02", "智谱 glm api", "secrets_resolve", {
+        "name_any": ["api-zhipu-glm-coding", "api-zhipu-glm-general"],
+    }),
+    Case("S03", "github token", "secrets_resolve", {
+        "name_any": ["github-token"],
+    }),
+    Case("S04", "ssh 虎虎", "secrets_resolve", {
+        "name_any": ["ssh-虎虎", "ssh-huhu", "虎虎-huhu", "huhu"],
     }),
     # --- 安全：禁止明文入向量 ---
     Case("X01", "", "reject_secret", {
@@ -54,6 +78,47 @@ CASES: List[Case] = [
     }),
     # --- 文档按需 ---
     Case("D01", "", "help", {"level": "mini", "max_chars": 800}),
+    Case("D02", "", "help_short", {"level": "short", "min_chars": 400}),
+    # --- 健康 ---
+    Case("H01", "", "v5_health", {"min_score": 70, "has_links": True}),
+    Case("H02", "", "health", {"version_has": "v5"}),
+    # --- 再补几道 ---
+    Case("A05", "Vaultwarden 密码本地址", "ask", {
+        "content_any": ["vault", "8443", "密码", "bw-ai", "Vaultwarden"],
+    }),
+    Case("A06", "星枢密钥能不能写进向量", "ask", {
+        "content_any": ["禁止", "密码本", "Vaultwarden", "指针", "明文"],
+    }),
+    Case("W04", "失败后 STRACE 复盘", "ask", {
+        "content_any": ["STRACE", "根因", "因果", "验证", "失败"],
+    }),
+    # --- v1.2 记忆闭环强化 ---
+    Case("M01", "Agent 记忆如何召回如何存储", "ask", {
+        "min_conf": 0.4,
+        "trust_any": ["canon", "source"],
+        "content_any": ["召回", "存储", "记忆", "readback", "contract", "bootstrap", "星枢", "笔记"],
+        "require_readback": True,
+    }),
+    Case("M02", "团子学习工作手册 40 条", "ask", {
+        "content_any": ["WORKBOOK", "工作手册", "40", "Canon", "门禁", "召回"],
+    }),
+    Case("M03", "虎虎笔记和星枢谁优先", "ask", {
+        "trust_any": ["canon", "source"],
+        "content_any": ["笔记", "星枢", "权威", "听笔记", "GATEWAY", "L1"],
+        "require_readback": True,
+    }),
+    Case("M04", "纠正写回记忆闭环", "ask", {
+        "content_any": ["纠正", "写回", "lesson", "supersede", "correction"],
+    }),
+]
+
+EXTRA_CASES: List[Case] = [
+    Case("T01", "他去年的项目是什么", "ask", {"temporal_intent": "past"}),
+    Case("T02", "他现在的项目是什么", "ask", {"temporal_intent": "present"}),
+    Case("C01", "GATEWAY_LOCK DNS 定稿", "ask", {
+        "content_any": ["GATEWAY", "冻结", "DNS", "AdGuard"],
+        "content_none": ["169.254", "0网段断网", "凌晨起 0 网段"],
+    }),
 ]
 
 
@@ -122,6 +187,17 @@ def run_case(base: str, c: Case) -> Dict[str, Any]:
                 if not any(k.lower() in blob for k in c.expect["content_any"]):
                     ok = False
                     reasons.append("content miss")
+            if c.expect.get("content_none"):
+                ans = (composed.get("answer") or r.get("answer") or "").lower()
+                hit = [k for k in c.expect["content_none"] if k.lower() in ans]
+                if hit:
+                    ok = False
+                    reasons.append(f"answer leaked {hit}")
+            if c.expect.get("temporal_intent"):
+                got = (composed.get("temporal_intent") or "neutral")
+                if got != c.expect["temporal_intent"]:
+                    ok = False
+                    reasons.append(f"intent {got}!={c.expect['temporal_intent']}")
             if c.expect.get("require_readback"):
                 rbs = composed.get("readbacks") or []
                 if not rbs:
@@ -235,6 +311,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:26670")
     ap.add_argument("--out", default="")
+    ap.add_argument("--extra", action="store_true", help="加上时间意图/反串题探针")
     args = ap.parse_args()
     base = args.base.rstrip("/")
 
@@ -245,7 +322,8 @@ def main():
         return 2
 
     results = []
-    for c in CASES:
+    suite = list(CASES) + (EXTRA_CASES if args.extra else [])
+    for c in suite:
         results.append(run_case(base, c))
 
     passed = sum(1 for r in results if r["ok"])
@@ -269,7 +347,7 @@ def main():
     # also write latest
     try:
         from pathlib import Path
-        latest = Path(os.environ.get("NEBULA_REG_LATEST", str(Path(__file__).resolve().parents[1] / "data" / "regression" / "latest.json")))
+        latest = Path("/home/huhu/.local/state/nebula-regression/latest.json")
         latest.parent.mkdir(parents=True, exist_ok=True)
         latest.write_text(text, encoding="utf-8")
     except Exception:

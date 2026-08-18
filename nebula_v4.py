@@ -44,6 +44,16 @@ def infer_trust(
     head = (content or "")[:500]
     if any(m in head for m in ("【已过时", "SUPERSEDED", "已废弃", "仅历史")):
         return "superseded"
+    try:
+        from nebula_site import is_vault_src, is_scratch_src, is_demote_src
+        if is_scratch_src(src):
+            return "hearsay"
+        if is_vault_src(src):
+            if is_demote_src(src):
+                return "source"
+            return "canon"
+    except Exception:
+        pass
     if src.startswith("vault:gateway/") or "GATEWAY_LOCK" in src:
         return "canon"
     if src.startswith("vault:notes/01-") or src.startswith("vault:notes/02-"):
@@ -52,9 +62,11 @@ def infer_trust(
         return "canon"
     if "现行权威" in head or "Agent 必读" in head or "[现行" in head:
         return "canon"
-    if "SESSIONS/" in src or src.endswith(".md") and "SESSIONS" in src:
+    if "SESSIONS/" in src or ("SESSIONS" in src and src.endswith(".md")):
         return "hearsay"
-    if src in ("manual", "grok", "hermes", "api", "mcp", "distill") or not src:
+    if src in ("session-extract", "minimax-auto-sync"):
+        return "hearsay"
+    if src in ("manual", "grok", "hermes", "api", "mcp", "tuanzi-distill") or not src:
         return "source" if float(importance or 0.5) >= 0.85 else "synthesis"
     if float(importance or 0.5) >= 0.9:
         return "source"
@@ -339,6 +351,13 @@ def reflect_ask(
     category: Optional[str] = None,
     use_graph: bool = True,
     hops: int = 2,
+    drop_hearsay_if_canon: bool = True,
+    max_synthesis: int = 1,
+    temporal_intent: Optional[str] = None,
+    as_of: Optional[float] = None,
+    prefer_layers: Optional[list] = None,
+    tenant_id: Optional[str] = None,
+    precomputed_vector=None,
 ) -> Dict[str, Any]:
     """
     v4 反思检索：
@@ -373,10 +392,36 @@ def reflect_ask(
         category=category,
         use_hybrid=use_hybrid,
         enable_time_decay=True,
+        temporal_intent=temporal_intent,
+        as_of=as_of,
+        tenant_id=tenant_id,
+        precomputed_vector=precomputed_vector,
     )
     _ingest(raw1, 0, 1.0)
     timing["seed_ms"] = round((time.time() - t1) * 1000, 1)
     stages.append({"stage": "seed", "n": len(raw1 or []), "ms": timing["seed_ms"]})
+    _vis = ("图片", "照片", "截图", "这张图", "图里", "看图", "image", "photo", "screenshot")
+    q2 = query
+    for _k in _vis:
+        q2 = q2.replace(_k, " ")
+    q2 = " ".join(q2.split())
+    if q2 and q2 != query:
+        try:
+            raw_img = manager.search(
+                query=q2,
+                top_k=max(top_k, 4),
+                category="image",
+                use_hybrid=True,
+                enable_time_decay=True,
+                temporal_intent=temporal_intent,
+                as_of=as_of,
+                tenant_id=tenant_id,
+                precomputed_vector=precomputed_vector,
+            )
+            _ingest(raw_img, 0, 1.25)
+            stages.append({"stage": "image_recall", "q": q2, "n": len(raw_img or [])})
+        except Exception as _ie:
+            logger.warning("image_recall fail: %s", _ie)
 
     seed_packed = pack_results(
         list(all_raw.values()),
@@ -385,8 +430,10 @@ def reflect_ask(
         max_chars=max_chars,
         per_source=1,
         drop_superseded=True,
-        drop_hearsay_if_canon=True,
+        drop_hearsay_if_canon=drop_hearsay_if_canon,
+        max_synthesis=max_synthesis,
         compact=True,
+        prefer_layers=prefer_layers,
     )
 
     followups = improve_followups(query, seed_packed, max_followups=2)
@@ -421,6 +468,10 @@ def reflect_ask(
                     query=q,
                     top_k=max(top_k * 2, 8),
                     enable_time_decay=True,
+                    temporal_intent=temporal_intent,
+                    as_of=as_of,
+                    category=category,
+                    tenant_id=tenant_id,
                 )
                 for r in raw or []:
                     if "score" not in r or r.get("score") is None:
@@ -485,8 +536,10 @@ def reflect_ask(
         max_chars=max_chars,
         per_source=1,
         drop_superseded=True,
-        drop_hearsay_if_canon=True,
+        drop_hearsay_if_canon=drop_hearsay_if_canon,
+        max_synthesis=max_synthesis,
         compact=True,
+        prefer_layers=prefer_layers,
     )
     # 若仍无 canon，放宽 hearsay 限制再 pack 一次
     if packed and not any(r.get("trust") == "canon" for r in packed):
@@ -498,7 +551,9 @@ def reflect_ask(
             per_source=1,
             drop_superseded=True,
             drop_hearsay_if_canon=False,
+            max_synthesis=max_synthesis,
             compact=True,
+            prefer_layers=prefer_layers,
         )
         if packed2:
             packed = packed2

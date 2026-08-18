@@ -1,9 +1,10 @@
 # 星枢 Nebula Server
 
+[![Version](https://img.shields.io/badge/version-5.1.1-green.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](requirements.txt)
 
-> **可部署的 L2 向量记忆服务**：HTTP API（`v5.0-ultimate`）+ Obsidian 笔记同步 + 多 Agent hooks/skills  
+> **可部署的 L2 向量记忆服务**：HTTP API（`v5.1.1`）+ Obsidian 笔记同步 + 多 Agent hooks/skills  
 > `git clone` → 填 key → Docker / systemd / 本机 Python 一条命令跑起来。
 
 **不是**聊天日志垃圾场 · **不是**密钥库 · 不含内网地址与个人数据。
