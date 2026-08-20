@@ -99,6 +99,9 @@ pub fn router(st: AppState) -> Router {
         .route("/tags/merge", post(tags_merge))
         .route("/tags/cleanup", post(tags_cleanup))
         .route("/memory/add", post(memory_add))
+        .route("/memory/dupes", get(memory_dupes))
+        .route("/memory/gc", post(memory_gc))
+        .route("/memory/infer-layer", post(memory_infer_layer))
         .route("/memory/image/{id}", get(memory_image))
         .route("/memory/promote", post(memory_promote))
         .route("/memory/{id}", axum::routing::delete(memory_delete).put(memory_update))
@@ -112,6 +115,8 @@ pub fn router(st: AppState) -> Router {
         .route("/secrets/register", post(secrets_register))
         .route("/secrets/catalog-sync", post(secrets_catalog))
         .route("/secrets/resolve", post(secrets_resolve))
+        .route("/vault/status", get(vault_status))
+        .route("/vault/sync", post(vault_sync))
         .route("/v5/session-extract", post(v5_extract))
         .route("/v5/layered-recall", get(v5_layered).post(v5_layered))
         .route("/v5/promote-draft", post(v5_promote))
@@ -129,7 +134,9 @@ pub fn router(st: AppState) -> Router {
         .layer(CorsLayer::permissive())
 }
 
-async fn health() -> Json<Value> {
+async fn health(State(st): State<AppState>) -> Json<Value> {
+    let mat = st.eng.emb.read();
+    let rss = st.eng.rss_bytes();
     Json(json!({
         "status": "ok",
         "service": "nebula-memory",
@@ -138,6 +145,11 @@ async fn health() -> Json<Value> {
         "docs": "/help",
         "docs_hint": "GET /help (mini) | /help?level=short|full",
         "engine": "rust",
+        "emb_rows": mat.n(),
+        "emb_quant": "i16",
+        "emb_bytes": mat.nbytes(),
+        "rss_bytes": rss,
+        "rss_mb": rss.map(|b| ((b as f64) / 1024.0 / 1024.0 * 10.0).round() / 10.0),
     }))
 }
 
@@ -531,6 +543,28 @@ async fn stats(State(st): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn memory_dupes(Query(q): Query<HashMap<String, String>>, State(st): State<AppState>) -> impl IntoResponse {
+    let limit = qint(&q, "limit", 50);
+    match st.eng.duplicate_hashes(limit) {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+async fn memory_gc(State(st): State<AppState>) -> Json<Value> {
+    Json(st.eng.gc())
+}
+
+async fn memory_infer_layer(State(st): State<AppState>, body: Option<Json<Value>>) -> impl IntoResponse {
+    let data = body.map(|j| j.0).unwrap_or(json!({}));
+    let limit = data.get("limit").and_then(|x| x.as_i64()).unwrap_or(2000);
+    let dry_run = parse_bool(data.get("dry_run"), false);
+    match st.eng.infer_layers(limit, dry_run) {
+        Ok(v) => (StatusCode::OK, Json(merge_ok(v))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
+}
+
 async fn tags_cloud(Query(q): Query<HashMap<String, String>>, State(st): State<AppState>) -> impl IntoResponse {
     let limit = qint(&q, "limit", 30);
     match st.eng.tags_cloud(limit) {
@@ -752,8 +786,17 @@ async fn memory_promote(State(st): State<AppState>, Json(data): Json<Value>) -> 
         .collect();
     let slug = if slug.is_empty() { "note".into() } else { slug };
     let day = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let dest_dir = std::path::PathBuf::from("/home/huhu/obsidian-vault/notes/06-Agent会话提炼");
-    let _ = std::fs::create_dir_all(&dest_dir);
+    // 目标目录与回读命令均可配置，不写死机器路径
+    let subdir = std::env::var("NEBULA_PROMOTE_SUBDIR").unwrap_or_else(|_| "06-Agent会话提炼".into());
+    let key_prefix = std::env::var("NEBULA_VAULT_KEY_PREFIX").unwrap_or_else(|_| "notes/".into());
+    let wrap_label = std::env::var("NEBULA_VAULT_WRAP_LABEL").unwrap_or_else(|_| "[笔记]".into());
+    let dest_dir = crate::vault::vault_root().join(&subdir);
+    if std::fs::create_dir_all(&dest_dir).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("cannot create {}（配置 NEBULA_VAULT_ROOT / --vault-root）", dest_dir.display())})),
+        );
+    }
     let mut dest = dest_dir.join(format!("{day}-{slug}.md"));
     let mut n = 2;
     while dest.exists() {
@@ -768,16 +811,44 @@ async fn memory_promote(State(st): State<AppState>, Json(data): Json<Value>) -> 
     if std::fs::write(&dest, text).is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"write failed"})));
     }
-    let rel = format!("notes/06-Agent会话提炼/{}", dest.file_name().unwrap().to_string_lossy());
+    let rel = format!("{key_prefix}{subdir}/{}", dest.file_name().unwrap().to_string_lossy());
     let vault_key = format!("vault:{rel}");
+    let readback = crate::site::format_readback(&vault_key)
+        .filter(|s| s != &vault_key)
+        .unwrap_or_else(|| format!("read \"{}\"", dest.to_string_lossy().replace('\\', "/")));
     let content = format!(
-        "[虎虎笔记] path={rel} source={vault_key} title={title}\n回读命令: rxt read --host huhu \"{}\"\n---\n{}",
-        dest.display(),
+        "{wrap_label} path={rel} source={vault_key} title={title}\n回读命令: {readback}\n---\n{}",
         body.chars().take(4000).collect::<String>()
     );
     let vec = st.eng.embedder.embed(&content).await.unwrap_or_default();
     let added = st.eng.add(&content, &vault_key, Some("lesson"), None, 0.8, json!({}), false, None, vec);
     (StatusCode::OK, Json(json!({"status":"ok","path": dest, "vault_key": vault_key, "nebula": added.ok()})))
+}
+
+async fn vault_status(State(st): State<AppState>) -> Json<Value> {
+    Json(crate::vault::status(&st.eng))
+}
+
+async fn vault_sync(State(st): State<AppState>, body: Option<Json<Value>>) -> impl IntoResponse {
+    let data = body.map(|j| j.0).unwrap_or(json!({}));
+    let opts = crate::vault::SyncOpts {
+        force: parse_bool(data.get("force"), false),
+        dry_run: parse_bool(data.get("dry_run"), false),
+        only: data.get("only").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        prune: parse_bool(data.get("prune"), true),
+    };
+    match crate::vault::sync(&st.eng, opts).await {
+        Ok(v) => (StatusCode::OK, Json(merge_ok(v))),
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if msg.contains("already running") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(json!({"status":"error","error": msg})))
+        }
+    }
 }
 
 async fn memory_delete(Path(id): Path<i64>, State(st): State<AppState>) -> Json<Value> {

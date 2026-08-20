@@ -12,9 +12,14 @@ Environment=NEBULA_DB_PATH=/opt/nebula/data/memory_vectors.db
 Environment=NEBULA_BIND=0.0.0.0
 Environment=NEBULA_PORT=26670
 Environment=NEBULA_DOCS_DIR=/opt/nebula/docs
+Environment=NEBULA_VAULT_ROOT=/home/huhu/obsidian-vault/notes
+Environment=NEBULA_VAULT_WRAP_LABEL=[虎虎笔记]
+# 内置 Obsidian 同步（秒），可替代 vault-nebula-sync.timer + Python 脚本
+Environment=NEBULA_VAULT_SYNC_INTERVAL=900
 Environment=RUST_LOG=nebula_engine=info
 EnvironmentFile=-/etc/nebula/embed.env
 EnvironmentFile=-/etc/nebula/llm.env
+Environment=MALLOC_ARENA_MAX=2
 MemoryAccounting=yes
 MemoryHigh=150M
 MemoryMax=200M

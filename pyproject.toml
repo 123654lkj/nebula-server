@@ -1,6 +1,6 @@
 [project]
 name = "nebula-server"
-version = "5.1.1"
+version = "5.2.0"
 description = "星枢 Nebula — 自托管 Agent 可信记忆服务"
 readme = "README.md"
 license = { text = "MIT" }

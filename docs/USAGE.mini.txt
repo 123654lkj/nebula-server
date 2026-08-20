@@ -1,8 +1,10 @@
-【星枢 5.1.0】http://192.168.31.252:26670
+【星枢 5.2.0】http://192.168.31.252:26670
 默认：POST /ask {"query":"...","top_k":5} → 用 contract 或 pack（勿 dump 全文）
 会话起：POST /v5/bootstrap {"focus":"主题"} → 用 bootstrap
 写入：POST /memory/add  |  写回笔记：POST /memory/promote
 图片：/memory/add 带 image；回显 GET /memory/image/<id>
+占用：GET /stats 看 rss_mb；清理 POST /memory/gc；重复 GET /memory/dupes；分层 POST /memory/infer-layer
+笔记同步：POST /vault/sync {"only":"HOME"}；状态 GET /vault/status；配置见 nebula-engine --help
 真理库：vault 笔记优先；session-extract 只是线索。vault 命中必 readback
 trust=canon/source 可执行；superseded 勿用
 精排 qwen3-rerank；向量 qwen2.5-vl-embedding 2048

@@ -9,8 +9,13 @@ use anyhow::{anyhow, Result};
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// L2 归一化后的量化标度。i16 矩阵约为 f32 的一半 RSS，点积走整数。
+const EMB_Q: f32 = 32767.0;
+const EMB_COMPACT_AFTER: usize = 50;
 
 #[derive(Default, Clone)]
 pub struct AddExtra {
@@ -29,32 +34,87 @@ pub struct AddExtra {
 
 pub struct EmbMatrix {
     pub ids: Vec<i64>,
-    pub data: Vec<f32>, // 行优先，已 L2 归一
+    /// 行优先 i16，值为 round(f32 * 32767)，已 L2 归一。
+    pub data: Vec<i16>,
     pub dim: usize,
     pub deleted: HashSet<i64>,
 }
 
 impl EmbMatrix {
     pub fn n(&self) -> usize {
-        self.ids.len()
+        self.ids.len() - self.deleted.len().min(self.ids.len())
     }
-    pub fn scores(&self, q: &[f32]) -> Vec<(usize, f32)> {
+    pub fn nbytes(&self) -> usize {
+        self.ids.len() * std::mem::size_of::<i64>() + self.data.len() * std::mem::size_of::<i16>()
+    }
+    fn quantize_query(q: &[f32]) -> Vec<i16> {
+        q.iter()
+            .map(|x| (x.clamp(-1.0, 1.0) * EMB_Q).round() as i16)
+            .collect()
+    }
+    fn push_row(&mut self, id: i64, v: &[f32]) {
+        let mut row = v.to_vec();
+        if row.len() != self.dim {
+            row.resize(self.dim, 0.0);
+        }
+        l2_normalize(&mut row);
+        self.ids.push(id);
+        self.data
+            .extend(row.iter().map(|x| (x.clamp(-1.0, 1.0) * EMB_Q).round() as i16));
+    }
+    /// 只保留最大的 k 个点积，避免分配 N 条分数。
+    pub fn top_scores(&self, q: &[f32], k: usize) -> Vec<(usize, f32)> {
+        if k == 0 || self.ids.is_empty() {
+            return vec![];
+        }
+        let q16 = Self::quantize_query(q);
         let dim = self.dim;
-        let n = self.n();
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            if self.deleted.contains(&self.ids[i]) {
+        let qn = q16.len().min(dim);
+        let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::with_capacity(k + 1);
+        for i in 0..self.ids.len() {
+            if !self.deleted.is_empty() && self.deleted.contains(&self.ids[i]) {
                 continue;
             }
-            let row = &self.data[i * dim..(i + 1) * dim];
-            let mut s = 0.0f32;
-            let m = dim.min(q.len());
-            for j in 0..m {
-                s += row[j] * q[j];
+            let row = &self.data[i * dim..i * dim + qn];
+            let mut acc: i64 = 0;
+            for j in 0..qn {
+                acc += row[j] as i64 * q16[j] as i64;
             }
-            out.push((i, s));
+            if heap.len() < k {
+                heap.push(Reverse((acc, i)));
+            } else if acc > heap.peek().map(|Reverse((a, _))| *a).unwrap_or(i64::MIN) {
+                heap.pop();
+                heap.push(Reverse((acc, i)));
+            }
         }
+        let scale = EMB_Q * EMB_Q;
+        let mut out: Vec<(usize, f32)> = heap
+            .into_iter()
+            .map(|Reverse((acc, i))| (i, acc as f32 / scale))
+            .collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
+    }
+    pub fn compact(&mut self) -> usize {
+        if self.deleted.is_empty() {
+            return 0;
+        }
+        let dim = self.dim;
+        let mut new_ids = Vec::with_capacity(self.ids.len());
+        let mut new_data = Vec::with_capacity(self.data.len());
+        let mut removed = 0usize;
+        for (i, id) in self.ids.iter().enumerate() {
+            if self.deleted.contains(id) {
+                removed += 1;
+                continue;
+            }
+            new_ids.push(*id);
+            new_data.extend_from_slice(&self.data[i * dim..(i + 1) * dim]);
+        }
+        self.ids = new_ids;
+        self.data = new_data;
+        self.deleted.clear();
+        removed
     }
 }
 
@@ -127,9 +187,9 @@ fn pragmas(c: &Connection) {
         "PRAGMA journal_mode=WAL;
          PRAGMA busy_timeout=5000;
          PRAGMA synchronous=NORMAL;
-         PRAGMA cache_size=-8192;
-         PRAGMA mmap_size=33554432;
-         PRAGMA temp_store=MEMORY;
+         PRAGMA cache_size=-4096;
+         PRAGMA mmap_size=16777216;
+         PRAGMA temp_store=FILE;
          PRAGMA foreign_keys=ON;",
     );
 }
@@ -162,7 +222,7 @@ impl Engine {
             result_cache: Mutex::new(ResultCache::new()),
         };
         eng.reload_matrix()?;
-        // 磁盘查询缓存灌入 LRU（最多 256）
+        // 磁盘查询缓存灌入 LRU（最多 64，避免启动峰值）
         eng.warmup_qcache();
         Ok(eng)
     }
@@ -170,7 +230,7 @@ impl Engine {
     fn warmup_qcache(&self) {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT qkey, vector, dim FROM emb_query_cache ORDER BY access_count DESC LIMIT 256",
+            "SELECT qkey, vector, dim FROM emb_query_cache ORDER BY access_count DESC LIMIT 64",
         ) {
             Ok(s) => s,
             Err(_) => return,
@@ -184,11 +244,9 @@ impl Engine {
                 if dim as usize != EMBED_DIM {
                     continue;
                 }
-                let mut v = blob_to_f32(&blob);
+                let v = blob_to_f32(&blob);
                 if v.len() == EMBED_DIM {
-                    self.embedder.mem_put(&k, v.split_off(0));
-                    let _ = v;
-                    self.embedder.mem_put(&k, blob_to_f32(&blob));
+                    self.embedder.mem_put(&k, v);
                 }
             }
         }
@@ -220,7 +278,7 @@ impl Engine {
             }
             l2_normalize(&mut v);
             ids.push(id);
-            data.extend_from_slice(&v);
+            data.extend(v.iter().map(|x| (x.clamp(-1.0, 1.0) * EMB_Q).round() as i16));
             n += 1;
         }
         *self.emb.write() = EmbMatrix {
@@ -241,6 +299,116 @@ impl Engine {
     }
     pub fn cache_stats(&self) -> Value {
         self.result_cache.lock().stats()
+    }
+
+    pub fn rss_bytes(&self) -> Option<u64> {
+        process_rss_bytes()
+    }
+
+    pub fn gc(&self) -> Value {
+        let rss0 = process_rss_bytes();
+        let removed = self.emb.write().compact();
+        let cache_before = {
+            let mut c = self.result_cache.lock();
+            let n = c.map.len();
+            c.map.clear();
+            n
+        };
+        let rss1 = process_rss_bytes();
+        json!({
+            "status": "ok",
+            "compacted": removed,
+            "result_cache_cleared": cache_before,
+            "emb_rows": self.emb.read().n(),
+            "emb_bytes": self.emb.read().nbytes(),
+            "rss_bytes_before": rss0,
+            "rss_bytes_after": rss1,
+        })
+    }
+
+    pub fn duplicate_hashes(&self, limit: i64) -> Result<Value> {
+        self.with_conn(|c| {
+            let mut st = c.prepare(
+                "SELECT content_hash, COUNT(*) AS n, GROUP_CONCAT(id) AS ids
+                 FROM memories
+                 WHERE ifnull(is_compressed,0)=0 AND content_hash IS NOT NULL AND length(content_hash)>8
+                 GROUP BY content_hash HAVING n>1
+                 ORDER BY n DESC LIMIT ?",
+            )?;
+            let rows: Vec<Value> = st
+                .query_map(params![limit], |r| {
+                    Ok(json!({
+                        "content_hash": r.get::<_, String>(0)?,
+                        "count": r.get::<_, i64>(1)?,
+                        "ids": r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    }))
+                })?
+                .flatten()
+                .collect();
+            Ok(json!({"status":"ok","count": rows.len(), "dupes": rows}))
+        })
+    }
+
+    /// 按来源启发式补 memory_layer，不覆盖已有分层。vault→semantic，会话→episodic，skill/code→procedural。
+    pub fn infer_layers(&self, limit: i64, dry_run: bool) -> Result<Value> {
+        if self.readonly && !dry_run {
+            return Err(anyhow!("database readonly"));
+        }
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(
+            "SELECT id, ifnull(source_file,''), ifnull(category,''), ifnull(metadata,'{}')
+             FROM memories
+             WHERE ifnull(is_compressed,0)=0
+               AND (json_extract(ifnull(metadata,'{}'), '$.memory_layer') IS NULL
+                    OR json_extract(ifnull(metadata,'{}'), '$.memory_layer') = '')
+             ORDER BY id DESC LIMIT ?",
+        )?;
+        let rows: Vec<(i64, String, String, String)> = st
+            .query_map(params![limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .flatten()
+            .collect();
+        drop(st);
+        let mut semantic = 0i64;
+        let mut episodic = 0i64;
+        let mut procedural = 0i64;
+        let mut skipped = 0i64;
+        let now = now_ts();
+        for (id, source, cat, meta) in rows {
+            let layer = infer_memory_layer(&source, &cat);
+            let Some(layer) = layer else {
+                skipped += 1;
+                continue;
+            };
+            match layer {
+                "semantic" => semantic += 1,
+                "episodic" => episodic += 1,
+                "procedural" => procedural += 1,
+                _ => skipped += 1,
+            }
+            if dry_run {
+                continue;
+            }
+            let mut obj: Value = serde_json::from_str(&meta).unwrap_or(json!({}));
+            if !obj.is_object() {
+                obj = json!({});
+            }
+            obj["memory_layer"] = json!(layer);
+            conn.execute(
+                "UPDATE memories SET metadata=?, updated_at=? WHERE id=?",
+                params![obj.to_string(), now, id],
+            )?;
+        }
+        Ok(json!({
+            "status": "ok",
+            "dry_run": dry_run,
+            "semantic": semantic,
+            "episodic": episodic,
+            "procedural": procedural,
+            "skipped": skipped,
+            "updated": if dry_run { 0 } else { semantic + episodic + procedural },
+        }))
     }
 
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
@@ -266,21 +434,14 @@ impl Engine {
                 .ok_or_else(|| anyhow!("no_query_vector"))?
         };
         l2_normalize(&mut q);
-        let scores = {
+        let fetch_k = (opts.top_k * 3).max(1);
+        let top = {
             let mat = self.emb.read();
-            mat.scores(&q)
+            mat.top_scores(&q, fetch_k)
         };
-        if scores.is_empty() {
+        if top.is_empty() {
             return Ok(vec![]);
         }
-        let fetch_k = (opts.top_k * 3).min(scores.len()).max(1);
-        let mut top = scores;
-        if fetch_k < top.len() {
-            let cut = top.len() - fetch_k;
-            top.select_nth_unstable_by(cut, |a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            top = top.split_off(cut);
-        }
-        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mat = self.emb.read();
         let mut ids = vec![];
         let mut scs = vec![];
@@ -646,6 +807,8 @@ impl Engine {
             } else {
                 format!("{db_size}B")
             };
+            let mat = self.emb.read();
+            let rss = process_rss_bytes();
             Ok(json!({
                 "total_memories": total,
                 "categories": cats,
@@ -653,7 +816,11 @@ impl Engine {
                 "embedding_cache": self.embedder.stats(),
                 "engine": "rust",
                 "readonly": self.readonly,
-                "emb_rows": self.emb.read().n(),
+                "emb_rows": mat.n(),
+                "emb_quant": "i16",
+                "emb_bytes": mat.nbytes(),
+                "rss_bytes": rss,
+                "rss_mb": rss.map(|b| ((b as f64) / 1024.0 / 1024.0 * 10.0).round() / 10.0),
             }))
         })
     }
@@ -714,7 +881,10 @@ impl Engine {
                 "cached": false,
                 "engine": "rust",
                 "emb_rows": self.emb.read().n(),
-                "rss_hint": "nebula-engine",
+                "emb_quant": "i16",
+                "emb_bytes": self.emb.read().nbytes(),
+                "rss_bytes": process_rss_bytes(),
+                "rss_mb": process_rss_bytes().map(|b| ((b as f64) / 1024.0 / 1024.0 * 10.0).round() / 10.0),
             }))
         })
     }
@@ -858,14 +1028,7 @@ impl Engine {
         }
         drop(conn);
         {
-            let mut mat = self.emb.write();
-            let mut v = vec.clone();
-            if v.len() != EMBED_DIM {
-                v.resize(EMBED_DIM, 0.0);
-            }
-            l2_normalize(&mut v);
-            mat.ids.push(mid);
-            mat.data.extend_from_slice(&v);
+            self.emb.write().push_row(mid, &vec);
         }
         let mut out = json!({"id": mid, "is_duplicate": false, "duplicate_of": null, "similarity_score": similarity_score, "trust": trust});
         if extra.modality_image {
@@ -873,6 +1036,31 @@ impl Engine {
             out["image_url"] = json!(format!("/memory/image/{mid}"));
         }
         Ok(out)
+    }
+
+    /// 按 source_file 删除全部行（vault 同步重灌前用），矩阵懒删除并按阈值 compact。
+    pub fn delete_by_source(&self, source: &str) -> Result<i64> {
+        if self.readonly {
+            return Err(anyhow!("database readonly"));
+        }
+        let ids: Vec<i64> = {
+            let conn = self.conn.lock();
+            let mut st = conn.prepare("SELECT id FROM memories WHERE source_file=?")?;
+            let ids: Vec<i64> = st.query_map(params![source], |r| r.get(0))?.flatten().collect();
+            drop(st);
+            conn.execute("DELETE FROM memories WHERE source_file=?", params![source])?;
+            ids
+        };
+        if !ids.is_empty() {
+            let mut mat = self.emb.write();
+            for id in &ids {
+                mat.deleted.insert(*id);
+            }
+            if mat.deleted.len() >= EMB_COMPACT_AFTER {
+                mat.compact();
+            }
+        }
+        Ok(ids.len() as i64)
     }
 
     pub fn delete(&self, id: i64) -> Result<bool> {
@@ -884,7 +1072,11 @@ impl Engine {
             conn.execute("DELETE FROM memories WHERE id=?", params![id])?
         };
         if n > 0 {
-            self.emb.write().deleted.insert(id);
+            let mut mat = self.emb.write();
+            mat.deleted.insert(id);
+            if mat.deleted.len() >= EMB_COMPACT_AFTER {
+                mat.compact();
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -1340,6 +1532,36 @@ impl Engine {
     }
 }
 
+fn process_rss_bytes() -> Option<u64> {
+    let txt = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let rss_pages: u64 = txt.split_whitespace().nth(1)?.parse().ok()?;
+    Some(rss_pages.saturating_mul(4096))
+}
+
+fn infer_memory_layer(source: &str, category: &str) -> Option<&'static str> {
+    let s = source.to_lowercase();
+    let c = category.to_lowercase();
+    if s.starts_with("vault:") || s.contains("obsidian-vault") || s.contains("gateway_lock") {
+        return Some("semantic");
+    }
+    if s.contains("session-extract")
+        || s.contains("session_vault")
+        || s.contains("sessions/")
+        || s.contains("minimax-auto-sync")
+    {
+        return Some("episodic");
+    }
+    if s.contains("skill")
+        || s.contains("/skills/")
+        || c == "code"
+        || c == "debug"
+        || s.ends_with("skill.md")
+    {
+        return Some("procedural");
+    }
+    None
+}
+
 fn blob_to_f32(blob: &[u8]) -> Vec<f32> {
     blob.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1399,11 +1621,19 @@ fn maturity_score(trust: &serde_json::Map<String, Value>, links: &serde_json::Ma
     }
     score += 10;
     let mut reg = json!({});
-    if let Ok(txt) = std::fs::read_to_string("/home/huhu/.local/state/nebula-regression/latest.json") {
-        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-            let pr = v.get("pass_rate").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            score += (pr * 25.0) as i64;
-            reg = v;
+    let reg_candidates = [
+        std::env::var("NEBULA_REG_LATEST").unwrap_or_default(),
+        "/home/huhu/.local/state/nebula-regression/latest.json".into(),
+        "./data/regression/latest.json".into(),
+    ];
+    for cand in reg_candidates.iter().filter(|s| !s.is_empty()) {
+        if let Ok(txt) = std::fs::read_to_string(cand) {
+            if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                let pr = v.get("pass_rate").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                score += (pr * 25.0) as i64;
+                reg = v;
+                break;
+            }
         }
     }
     // secrets 解锁在 http 层补
@@ -1425,4 +1655,34 @@ fn maturity_score(trust: &serde_json::Map<String, Value>, links: &serde_json::Ma
         "regression_passed": reg.get("passed"),
         "regression_total": reg.get("total"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{infer_memory_layer, l2_normalize, EmbMatrix, EMBED_DIM};
+    use std::collections::HashSet;
+
+    #[test]
+    fn i16_self_dot_near_one() {
+        let mut v: Vec<f32> = (0..EMBED_DIM).map(|i| ((i % 19) as f32 - 9.0) / 9.0).collect();
+        l2_normalize(&mut v);
+        let mut mat = EmbMatrix {
+            ids: vec![],
+            data: vec![],
+            dim: EMBED_DIM,
+            deleted: HashSet::new(),
+        };
+        mat.push_row(1, &v);
+        let top = mat.top_scores(&v, 1);
+        assert_eq!(top.len(), 1);
+        assert!((top[0].1 - 1.0).abs() < 0.002, "cosine={}", top[0].1);
+    }
+
+    #[test]
+    fn infer_layer_heuristics() {
+        assert_eq!(infer_memory_layer("vault:notes/HOME.md", "fact"), Some("semantic"));
+        assert_eq!(infer_memory_layer("session-extract", "lesson"), Some("episodic"));
+        assert_eq!(infer_memory_layer("agents/skills/ponytail/SKILL.md", "code"), Some("procedural"));
+        assert_eq!(infer_memory_layer("rxt-mem", "lesson"), None);
+    }
 }

@@ -7,8 +7,8 @@ pub const EMBED_DIM: usize = 2048;
 pub const EMBED_MODEL: &str = "qwen2.5-vl-embedding";
 pub const RERANK_MODEL: &str = "qwen3-rerank";
 pub const PRODUCT: &str = "Nebula Memory";
-pub const RELEASE: &str = "v5.1.1";
-pub const VERSION: &str = "5.1.1";
+pub const RELEASE: &str = "v5.2.0";
+pub const VERSION: &str = "5.2.0";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Hit {

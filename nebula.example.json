@@ -1,0 +1,31 @@
+{
+  "_说明": "星枢配置文件示例。复制为 nebula.json 放在工作目录，或 --config 指定。优先级 CLI > 环境变量 > 本文件 > 默认。小写键自动映射 NEBULA_*，全大写键（如 BAILIAN_API_KEY）原样透传——密钥建议仍走 EnvironmentFile，不要提交进 git。",
+
+  "db_path": "./data/memory_vectors.db",
+  "bind": "0.0.0.0",
+  "port": 26670,
+  "docs_dir": "./docs",
+
+  "vault_root": "./vault/notes",
+  "vault_key_prefix": "notes/",
+  "vault_wrap_label": "[笔记]",
+  "vault_sync_interval": 900,
+  "vault_max_bytes": 120000,
+  "vault_chunk": 900,
+  "vault_overlap": 100,
+  "vault_include": ["HOME.md", "PROJECT.md", "0*-*/*.md"],
+  "vault_exclude_dirs": ["_归档/", ".obsidian/", ".trash/"],
+  "vault_exclude_names": ["主密码哈希"],
+  "vault_rules": [
+    { "contains": ["GATEWAY_LOCK", "网关"], "category": "infrastructure", "importance": 0.95 },
+    { "contains": ["04-项目笔记"], "category": "project", "importance": 0.85 }
+  ],
+
+  "promote_subdir": "06-Agent会话提炼",
+  "readback_fmt": "rxt read --host huhu {path}",
+  "path_map": "notes/=/home/huhu/obsidian-vault/",
+
+  "pin_regex": "GATEWAY_LOCK|[A-Za-z0-9._-]{3,}\\.md|WORKBOOK-40|_CANON",
+  "canon_substr": "vault:gateway/,vault:notes/01-,vault:notes/02-,notes/HOME.md,notes/PROJECT.md",
+  "reg_latest": "./data/regression/latest.json"
+}

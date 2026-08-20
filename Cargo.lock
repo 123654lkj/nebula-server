@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "nebula-engine"
-version = "5.1.1"
+version = "5.1.2"
 dependencies = [
  "anyhow",
  "axum",

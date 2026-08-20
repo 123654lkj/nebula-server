@@ -1,6 +1,6 @@
 # 星枢 API 速查（short）
 
-Base `http://192.168.31.252:26670` · **5.1.0**  
+Base `http://192.168.31.252:26670` · **5.2.0**  
 向量 `qwen2.5-vl-embedding` 2048 · 精排 `qwen3-rerank` · LLM（改写/深搜）`NEBULA_LLM_MODEL`
 
 ## Agent 必用
@@ -12,7 +12,11 @@ Base `http://192.168.31.252:26670` · **5.1.0**
 | 写入索引 | POST `/memory/add` | id, trust |
 | 写回真理库 | POST `/memory/promote` `{"title","content"}` | path, vault_key |
 | 图片入库 | POST `/memory/add` + `image` | image_url |
-| 用法 | GET `/help?level=short` | text |
+| 占用/清理 | GET `/stats` · POST `/memory/gc` | rss_mb, compacted |
+| 重复记忆 | GET `/memory/dupes` | hash 分组 |
+| 补分层 | POST `/memory/infer-layer` | semantic/episodic/procedural |
+| 笔记同步 | POST `/vault/sync` `{force,dry_run,only,prune}` | stats, pruned |
+| 同步状态 | GET `/vault/status` | root, last_run, interval |
 
 ## 裁决
 
