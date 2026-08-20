@@ -1,21 +1,24 @@
 [Unit]
-Description=Nebula (星枢) vector memory server
-After=network-online.target
-Wants=network-online.target
+Description=星枢 (Nebula) 向量记忆系统
+After=network.target
 
 [Service]
 Type=simple
-Environment=MALLOC_ARENA_MAX=2
-Environment=PYTHONUNBUFFERED=1
-MemoryAccounting=yes
-MemoryHigh=280M
-MemoryMax=400M
-TasksMax=64
+ExecStart=/usr/local/bin/nebula-engine
 WorkingDirectory=/opt/nebula
-EnvironmentFile=-/opt/nebula/.env
-ExecStart=/opt/nebula/.venv/bin/python /opt/nebula/vector_memory_server.py
-Restart=on-failure
+Restart=always
 RestartSec=3
+Environment=NEBULA_DB_PATH=/opt/nebula/data/memory_vectors.db
+Environment=NEBULA_BIND=0.0.0.0
+Environment=NEBULA_PORT=26670
+Environment=NEBULA_DOCS_DIR=/opt/nebula/docs
+Environment=RUST_LOG=nebula_engine=info
+EnvironmentFile=-/etc/nebula/embed.env
+EnvironmentFile=-/etc/nebula/llm.env
+MemoryAccounting=yes
+MemoryHigh=90M
+MemoryMax=120M
+TasksMax=64
 
 [Install]
 WantedBy=multi-user.target

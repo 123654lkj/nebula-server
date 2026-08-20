@@ -1,0 +1,34 @@
+[Unit]
+Description=星枢 Rust 引擎（侧路 :26672，现网 SQLite 原库）
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/huhu/projects/nebula-engine
+ExecStart=/home/huhu/projects/nebula-engine/target/release/nebula-engine
+EnvironmentFile=-/etc/nebula/embed.env
+EnvironmentFile=-/etc/nebula/llm.env
+Environment=NEBULA_DB_PATH=/opt/nebula/data/memory_vectors.db
+Environment=NEBULA_BIND=0.0.0.0
+Environment=NEBULA_PORT=26672
+Environment=NEBULA_DOCS_DIR=/opt/nebula/docs
+Environment=NEBULA_PIN_REGEX=GATEWAY_LOCK|[A-Za-z0-9._-]{3,}\.md|WORKBOOK-40|_CANON
+Environment=NEBULA_CANON_SUBSTR=vault:gateway/,GATEWAY_LOCK,vault:notes/01-,vault:notes/02-,notes/HOME.md,notes/PROJECT.md,团子学习/
+Environment=NEBULA_DEMOTE_SUBSTR=/04-,/05-,notes/04-,notes/05-
+Environment=NEBULA_PATH_MAP=gateway/=/opt/,notes/=/home/huhu/obsidian-vault/
+Environment=NEBULA_READBACK_FMT=rxt read --host huhu {path}
+Environment=NEBULA_HEARSAY_SUBSTR=SESSIONS/,session-extract,minimax-auto-sync,.zcode/obsidian/,openclaw/workspace/memory
+Environment=NEBULA_SCRATCH_SUBSTR=session-extract,minimax-auto-sync,.zcode/obsidian/,openclaw/workspace/memory,/home/xiantuer/.openclaw/
+Environment=BITWARDENCLI_APPDATA_DIR=/home/huhu/.config/Bitwarden CLI
+Environment=BW_SESSION_FILE=/tmp/bw-session-huhu
+Environment=NODE_EXTRA_CA_CERTS=/etc/ssl/certs/zcode-network-ca.pem
+Environment=RUST_LOG=nebula_engine=info
+MemoryAccounting=yes
+MemoryHigh=80M
+MemoryMax=100M
+TasksMax=64
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
