@@ -502,6 +502,7 @@ pub async fn sync(eng: &Engine, opts: SyncOpts) -> Result<Value> {
         let mut ids: Vec<i64> = vec![];
         let mut added = 0i64;
         let mut file_errors = 0i64;
+        let mut secret_skips = 0i64;
         for (i, ch) in chunks.iter().enumerate() {
             let content = wrap_chunk(&cfg, abs, &key, &title, i, total, ch);
             let vec = match eng.embedder.embed(&content).await {
@@ -522,8 +523,14 @@ pub async fn sync(eng: &Engine, opts: SyncOpts) -> Result<Value> {
                     }
                 }
                 Err(e) => {
-                    // content_hash UNIQUE 视为已存在
-                    if !e.to_string().contains("UNIQUE") {
+                    let msg = e.to_string();
+                    if msg.contains("UNIQUE") {
+                        // content_hash 已存在，视为成功
+                    } else if msg.contains("SECRET_REJECTED") {
+                        // 密钥明文由安全门拒绝：永久跳过不重试，文件变更后会重新评估
+                        secret_skips += 1;
+                        tracing::warn!("add {key}#{i}: 密钥明文 chunk 跳过（不重试）");
+                    } else {
                         file_errors += 1;
                         tracing::warn!("add {key}#{i}: {e}");
                     }
@@ -532,6 +539,7 @@ pub async fn sync(eng: &Engine, opts: SyncOpts) -> Result<Value> {
         }
         bump(&mut stats, "added", added);
         bump(&mut stats, "errors", file_errors);
+        bump(&mut stats, "secret_skipped", secret_skips);
         if file_errors > 0 {
             // 有失败不落 state：下一轮整文件重试（重灌为 delete+add，安全）
             tracing::warn!("vault sync {key}: {file_errors} 个 chunk 失败，state 不更新待重试");
@@ -543,6 +551,7 @@ pub async fn sync(eng: &Engine, opts: SyncOpts) -> Result<Value> {
             "path": abs.to_string_lossy(), "title": title,
             "category": cat, "importance": imp,
             "chunks": total, "ids": ids.iter().rev().take(30).rev().collect::<Vec<_>>(),
+            "secret_skipped": secret_skips,
             "synced_at": now_ts(),
         });
         let _ = save_state(&cfg, &state);
