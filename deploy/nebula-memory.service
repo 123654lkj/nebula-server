@@ -16,8 +16,8 @@ Environment=RUST_LOG=nebula_engine=info
 EnvironmentFile=-/etc/nebula/embed.env
 EnvironmentFile=-/etc/nebula/llm.env
 MemoryAccounting=yes
-MemoryHigh=90M
-MemoryMax=120M
+MemoryHigh=150M
+MemoryMax=200M
 TasksMax=64
 
 [Install]
