@@ -1,5 +1,7 @@
 # 星枢 Nebula Engine（Rust）
 
+> 📖 [完整使用与运维手册](docs/HANDBOOK.md) — 从入门、全部 HTTP/MCP 接口，到配置、部署、备份、回滚和已知限制；按 Rust 5.2.0 源码核对。
+
 > 分支：`rust` · 现网 SQLite **原库原表**，HTTP API 对齐 Python 5.1.x  
 > 常驻目标：RSS 约 50MB（Rust 5.2.0；实际 RSS 以 /stats 为准；Python 版 350MB+）
 
