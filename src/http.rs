@@ -487,6 +487,7 @@ async fn add_with_image(
     image_ref: Option<&str>,
     image_bytes: Option<(Vec<u8>, String)>,
 ) -> Result<Value, String> {
+    validate_content(content)?;
     let mut content = content.to_string();
     let dir = st.eng.image_dir.clone();
     let resolved = if let Some((bytes, name)) = image_bytes {
@@ -634,6 +635,15 @@ async fn memory_add(headers: HeaderMap, State(st): State<AppState>, req: Request
     memory_add_json(headers, st, data).await.into_response()
 }
 
+fn validate_content(content: &str) -> Result<(), String> {
+    let hits = crate::secrets::scan_secrets(content);
+    if hits.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("SECRET_REJECTED: secret_in_content ({})", hits.join(",")))
+    }
+}
+
 fn add_err(e: String) -> (StatusCode, Json<Value>) {
     if e.starts_with("SECRET_REJECTED") || e.contains("secret_in_content") {
         (
@@ -647,6 +657,9 @@ fn add_err(e: String) -> (StatusCode, Json<Value>) {
 
 async fn memory_add_json(headers: HeaderMap, st: AppState, data: Value) -> impl IntoResponse {
     let content = data.get("content").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if let Err(e) = validate_content(&content) {
+        return add_err(e).into_response();
+    }
     let source = data.get("source").and_then(|x| x.as_str()).unwrap_or("api").to_string();
     let mut meta = data.get("metadata").cloned().unwrap_or(json!({}));
     let tenant = crate::site::resolve_tenant(
@@ -1326,3 +1339,16 @@ async fn mcp_call(st: &AppState, name: &str, args: Value) -> Value {
 // 占位：Request 仅 mcp 内部可能用到
 #[allow(dead_code)]
 fn _unused(_r: Request<Body>) {}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn rejects_secret_without_echoing_it() {
+        let fake = format!("sk-{}", "a".repeat(32));
+        let err = validate_content(&fake).unwrap_err();
+        assert!(!err.contains(&fake));
+        assert_eq!(add_err(err).0, StatusCode::BAD_REQUEST);
+        assert!(validate_content("Vaultwarden pointer: api-example").is_ok());
+    }
+}

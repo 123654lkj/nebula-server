@@ -75,7 +75,11 @@ pub fn format_readback(src: &str) -> Option<String> {
     for spec in map {
         if let Some((pre, dest)) = spec.split_once('=') {
             if path.starts_with(pre) {
-                logical = format!("{}/{}", dest.trim_end_matches('/'), path);
+                logical = if dest.contains("{suffix}") {
+                    dest.replace("{suffix}", &path[pre.len()..])
+                } else {
+                    format!("{}/{}", dest.trim_end_matches('/'), path)
+                };
                 break;
             }
         }

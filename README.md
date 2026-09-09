@@ -1,7 +1,7 @@
 # 星枢 Nebula Engine（Rust）
 
 > 分支：`rust` · 现网 SQLite **原库原表**，HTTP API 对齐 Python 5.1.x  
-> 常驻目标：RSS 约 50MB（现网 Rust 5.1.1 约 80MB；Python 版 350MB+）
+> 常驻目标：RSS 约 50MB（Rust 5.2.0；实际 RSS 以 /stats 为准；Python 版 350MB+）
 
 ## 它做什么
 
@@ -59,3 +59,12 @@ python3 scripts/nebula_regression.py --base http://127.0.0.1:26670 --extra
 ```
 
 Python 版在 `main` 分支。本分支是常驻引擎的 Rust 实现，不改 SQLite schema。
+
+## 虎虎部署核对
+
+当前引擎 5.2.0；线上监听 26670，未配置时默认端口为 26672。
+版本以 `nebula-engine --version` 和 `/v5/health` 为准；README、VERSION、docs 随部署同步。
+虎虎笔记根目录为 `/home/huhu/obsidian-vault`，不是旧的 `notes/` 子目录。
+`NEBULA_PATH_MAP` 支持目标中的 `{suffix}` 替换匹配前缀后的路径，例如
+`notes/=/home/huhu/obsidian-vault/{suffix}`；不使用占位符时保留原先拼接完整逻辑路径的行为。
+写入接口在调用图片或向量服务前拒绝密钥明文，数据库层仍保留二次检查。

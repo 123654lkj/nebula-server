@@ -1,4 +1,4 @@
-# 星枢 Nebula 5.1.0
+# 星枢 Nebula 5.2.0
 
 > Agent 不要把本 full 文档默认塞进 system prompt。默认 `GET /help`（mini）。
 
@@ -7,7 +7,7 @@
 | 项 | 值 |
 |----|-----|
 | 名称 | 星枢 Nebula Memory |
-| 版本 | **5.1.0** |
+| 版本 | **5.2.0** |
 | Base | `http://192.168.31.252:26670`（仅局域网，不在团子 244） |
 | 真理库 | Obsidian：`/home/huhu/obsidian-vault/notes/` |
 | 向量 | `qwen2.5-vl-embedding` · 2048 维 · 百炼 |
